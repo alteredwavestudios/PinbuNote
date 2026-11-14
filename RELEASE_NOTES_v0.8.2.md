@@ -1,5 +1,7 @@
 # Yomu Note 0.8.2 🌸 — Reading View Memory (release candidate 1)
 
+**Windows installer RC2:** Setup no longer launches Yomu Note automatically. Once Setup has closed, start the app from the Windows Start menu. This avoids the previously observed installer-only first-launch crash; the exact cause remains under investigation.
+
 Yomu Note is an offline-first desktop notebook for academic readings, PDF
 annotations, rich-text notes, reading checklists and shareable `.yomunote` tabs.
 This **pre-release** adds a much more continuous reading experience.

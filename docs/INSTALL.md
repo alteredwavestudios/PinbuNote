@@ -10,6 +10,8 @@
 
 ## Windows (x64)
 
+**After installation, close the Setup wizard and launch Yomu Note from the Windows Start menu.** The v0.8.2 RC2 installer does not automatically launch the app from Setup; an installer-launched first run could fail even when normal Start menu launching worked.
+
 Download the Windows Setup EXE from the latest *published* release (currently `YomuNote_Setup_v0.8.1b.exe`; the upcoming v0.8.2 build will be `YomuNote_Setup_v0.8.2.exe`). Close an older running Yomu Note, run the installer and launch it from the Start menu. Updates should use the same application ID as previous releases. If SmartScreen warns about an unsigned preview build, only proceed if you trust the repository and have verified the release source. The first installer is not code-signed.
 
 ## macOS (Apple Silicon or Intel)
