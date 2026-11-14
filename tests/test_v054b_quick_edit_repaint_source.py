@@ -45,13 +45,33 @@ def test_backdrop_tracks_and_never_blocks_interactive_widgets():
     assert 'backing.hide()' in sync
 
 
-def test_all_new_multiply_highlighting_tools_start_fully_opaque():
-    # The UI passes the explicit opacity into new marks; legacy saved marks
-    # remain unchanged, as do the default-less stroke/highlight model readers.
-    source = body('ImageCanvas', '__init__')
-    assert "self.tool_styles['marker'] = {'color': self.highlight_color, 'opacity': 100," in source
-    assert "self.tool_styles['highlight'] = {'color': self.highlight_color,\n                                          'opacity': 100," in source
-    assert "self.tool_styles['highlight_line'] = {'color': self.highlight_color,\n                                               'opacity': 100," in source
+def test_new_multiply_highlighting_tools_start_at_eighty_percent():
+    # Check the assigned values through the AST, without depending on how
+    # many spaces the source code uses for continuation lines.
+    initializer = next(
+        member for node in MODULE.body
+        if isinstance(node, ast.ClassDef) and node.name == 'ImageCanvas'
+        for member in node.body
+        if isinstance(member, ast.FunctionDef) and member.name == '__init__'
+    )
+    opacities = {}
+    for node in ast.walk(initializer):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        for target in node.targets:
+            if (not isinstance(target, ast.Subscript)
+                    or not isinstance(target.value, ast.Attribute)
+                    or target.value.attr != 'tool_styles'
+                    or not isinstance(target.slice, ast.Constant)):
+                continue
+            tool = target.slice.value
+            if tool not in ('marker', 'highlight', 'highlight_area', 'highlight_line'):
+                continue
+            opacity = next((value.value for key, value in zip(node.value.keys, node.value.values)
+                            if isinstance(key, ast.Constant) and key.value == 'opacity'
+                            and isinstance(value, ast.Constant)), None)
+            opacities[tool] = opacity
+    assert opacities == dict.fromkeys(('marker', 'highlight', 'highlight_area', 'highlight_line'), 80)
     assert "kind == 'highlight'" in body('ImageCanvas', '_apply_item_appearance')
     # Older alpha values such as 35 remain accepted and saved unchanged.
     from yomunote.vector_marks import make_highlight, make_highlight_line, make_stroke

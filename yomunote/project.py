@@ -185,7 +185,10 @@ class Project:
         if version not in (2, 3, FORMAT_VERSION):
             raise ValueError(f'Project format v{version} is not supported. Supported versions: 2–{FORMAT_VERSION}.')
         annotations = data.get('annotations', {}) if version >= 3 else {}
-        highlight_color = data.get('highlight_color', '#FFE536')
+        # If a saved notebook predates the highlight_color field, preserve the
+        # original legacy yellow-orange default. Newly created notebooks
+        # explicitly save #FFE536, so this does not change their new default.
+        highlight_color = data.get('highlight_color', '#ffcf69')
         if not isinstance(highlight_color, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', highlight_color):
             if not recover_cosmetic:
                 raise ValueError('Invalid project highlight colour.')

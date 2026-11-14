@@ -95,11 +95,13 @@ def test_hover_does_not_hide_controls_or_destroy_backdrop(app, tmp_path, theme):
         window.close()
 
 
-def test_new_highlighter_defaults_are_100_percent(app):
+def test_new_highlighter_defaults_are_80_percent(app):
     from yomunote.window import ImageCanvas
     canvas = ImageCanvas()
     try:
-        for tool in ('marker', 'highlight', 'highlight_line'):
-            assert canvas.tool_styles[tool]['opacity'] == 100
+        assert canvas.highlight_color == '#FFE536'
+        for tool in ('marker', 'highlight', 'highlight_area', 'highlight_line'):
+            assert canvas.tool_styles[tool]['opacity'] == 80
+            assert canvas.tool_styles[tool]['color'] == '#FFE536'
     finally:
         canvas.close()

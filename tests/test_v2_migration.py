@@ -53,6 +53,32 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(new.notes_html, data['notes_html'])
             self.assertEqual(json.loads(manifest.read_text())['format'], 'yomu-note')
 
+    def test_new_and_legacy_highlight_colours_coexist(self):
+        """New notebooks get modern yellow; legacy notebooks keep their choice."""
+        with tempfile.TemporaryDirectory() as folder:
+            fresh = Project.create(Path(folder), 'Fresh Yellow')
+            self.assertEqual(fresh.highlight_color, '#FFE536')
+            self.assertEqual(Project.load(fresh.path).highlight_color, '#FFE536')
+
+            manifest = fresh.path / 'project.json'
+            data = json.loads(manifest.read_text(encoding='utf-8'))
+            data['version'] = 3
+            data['format'] = 'sumi-study'
+            data['highlight_color'] = '#123abc'
+            manifest.write_text(json.dumps(data), encoding='utf-8')
+            self.assertEqual(Project.load(fresh.path).highlight_color, '#123abc')
+
+            data.pop('highlight_color')
+            manifest.write_text(json.dumps(data), encoding='utf-8')
+            self.assertEqual(Project.load(fresh.path).highlight_color, '#ffcf69')
+
+            # Even a v4 project with the optional field missing must not
+            # silently change a legacy default used by older saved work.
+            data['version'] = FORMAT_VERSION
+            data['format'] = 'yomu-note'
+            manifest.write_text(json.dumps(data), encoding='utf-8')
+            self.assertEqual(Project.load(fresh.path).highlight_color, '#ffcf69')
+
     def test_new_project_has_yomunote_suffix(self):
         with tempfile.TemporaryDirectory() as folder:
             project = Project.create(Path(folder), 'Sakura study')

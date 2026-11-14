@@ -1266,7 +1266,7 @@ class ImageCanvas(QGraphicsView):
         self._fit = True
         self.setAcceptDrops(True)
         self.highlight_mode = False
-        self.highlight_color = '#ffcf69'
+        self.highlight_color = '#FFE536'
         self.annotation_tool = 'pan'
         self.pen_color = '#d74685'
         self.pen_width = 0.003
@@ -1279,7 +1279,7 @@ class ImageCanvas(QGraphicsView):
             for key in ('pen', 'line', 'arrow', 'rectangle', 'ellipse')}
         self.tool_styles['arrow']['head_width'] = .018
         self.tool_styles['arrow']['head_length'] = .025
-        # All three new Multiply highlighter tools start at 100% opacity.
+        # All four Multiply highlighter tools start at 80% opacity.
         # Existing saved strokes/highlights keep their original stored alpha.
         self.tool_styles['marker'] = {'color': self.highlight_color, 'opacity': 80,
                                        'width': .009, 'fill': None}
