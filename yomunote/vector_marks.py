@@ -143,7 +143,16 @@ def valid_highlight(mark: object) -> bool:
     if mark['kind'] == 'highlight':
         return (all(_unit(mark.get(key)) for key in ('x', 'y', 'w', 'h'))
                 and mark['x'] + mark['w'] <= 1.000001
-                and mark['y'] + mark['h'] <= 1.000001)
+                and mark['y'] + mark['h'] <= 1.000001
+                and ('segments' not in mark or (
+                    isinstance(mark['segments'], list)
+                    and 1 <= len(mark['segments']) <= 320
+                    and all(isinstance(box, list) and len(box) == 4
+                            and all(_unit(n) for n in box)
+                            and box[2] > 0 and box[3] > 0
+                            and box[0]+box[2] <= 1.000001
+                            and box[1]+box[3] <= 1.000001
+                            for box in mark['segments']))))
     return (isinstance(mark.get('id'), str)
             and all(_unit(mark.get(key)) for key in ('x1', 'y1', 'x2', 'y2'))
             and type(mark.get('width')) in (float, int)
@@ -159,6 +168,23 @@ def make_highlight(rect, color, opacity=35):
     if not valid_highlight(result):
         raise ValueError('Invalid rectangle highlight')
     return result
+
+
+def make_text_highlight(boxes, color, opacity=35):
+    """One editable/undoable mark with multiple line-fit rectangles."""
+    if not isinstance(boxes, list) or not 1 <= len(boxes) <= 320:
+        raise ValueError('Invalid text highlight length')
+    if any(not isinstance(box, list) or len(box) != 4 for box in boxes):
+        raise ValueError('Invalid text highlight boxes')
+    left = min(x for x, _, _, _ in boxes)
+    top = min(y for _, y, _, _ in boxes)
+    right = max(x+w for x, _, w, _ in boxes)
+    bottom = max(y+h for _, y, _, h in boxes)
+    mark = make_highlight((left, top, right-left, bottom-top), color, opacity)
+    mark['segments'] = [[float(v) for v in box] for box in boxes]
+    if not valid_highlight(mark):
+        raise ValueError('Invalid text highlight')
+    return mark
 
 
 def make_highlight_line(first, last, color, width, opacity=35):
@@ -199,8 +225,13 @@ def translated_vector(mark: dict, dx: float, dy: float) -> dict:
     dx = min(1.0 - right, max(-left, float(dx)))
     dy = min(1.0 - bottom, max(-top, float(dy)))
     if mark['kind'] == 'highlight':
-        return {**mark, 'x': min(1., max(0., mark['x'] + dx)),
-                'y': min(1., max(0., mark['y'] + dy))}
+        moved = {**mark, 'x': min(1., max(0., mark['x'] + dx)),
+                 'y': min(1., max(0., mark['y'] + dy))}
+        if mark.get('segments'):
+            moved['segments'] = [[min(1., max(0., x+dx)),
+                                   min(1., max(0., y+dy)), w, h]
+                                  for x,y,w,h in mark['segments']]
+        return moved
     moved = {**mark, 'x1': min(1., max(0., mark['x1'] + dx)),
              'y1': min(1., max(0., mark['y1'] + dy)),
              'x2': min(1., max(0., mark['x2'] + dx)),
@@ -307,6 +338,13 @@ def resized_vector(mark: dict, handle: str, x: float, y: float, *,
 
     if mark['kind'] == 'highlight':
         resized = {**mark, 'x': left, 'y': top, 'w': right-left, 'h': bottom-top}
+        if mark.get('segments'):
+            new_boxes = []
+            for bx, by, bw, bh in mark['segments']:
+                ax, ay = remap(bx, by)
+                ex, ey = remap(bx+bw, by+bh)
+                new_boxes.append([ax, ay, max(0., ex-ax), max(0., ey-ay)])
+            resized['segments'] = new_boxes
     elif mark['kind'] == 'stroke':
         resized = {**mark, 'points': [remap(*point) for point in mark['points']]}
     else:

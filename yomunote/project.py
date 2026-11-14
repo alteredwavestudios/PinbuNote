@@ -147,7 +147,7 @@ class Project:
     panel_order: list[str] = field(default_factory=lambda: list(PANEL_KEYS))
     identifier: str = field(default_factory=short_id)
     annotations: dict[str, list[dict]] = field(default_factory=dict)
-    highlight_color: str = '#ffcf69'
+    highlight_color: str = '#FFE536'
     # Cosmetic per-page reading position and root-group zoom state.
     reading_view: dict = field(default_factory=dict)
     loaded_version: int = field(default=FORMAT_VERSION, repr=False)
@@ -185,6 +185,9 @@ class Project:
         if version not in (2, 3, FORMAT_VERSION):
             raise ValueError(f'Project format v{version} is not supported. Supported versions: 2–{FORMAT_VERSION}.')
         annotations = data.get('annotations', {}) if version >= 3 else {}
+        # If a saved notebook predates the highlight_color field, preserve the
+        # original legacy yellow-orange default. Newly created notebooks
+        # explicitly save #FFE536, so this does not change their new default.
         highlight_color = data.get('highlight_color', '#ffcf69')
         if not isinstance(highlight_color, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', highlight_color):
             if not recover_cosmetic:
