@@ -46,6 +46,9 @@ ICON_PATHS = {
     'palette': '<circle cx="12" cy="12" r="9"/><circle cx="7" cy="10" r="1"/><circle cx="11" cy="6" r="1"/><circle cx="17" cy="9" r="1"/><path d="M13 20c-3-1-3-4-1-5 2-1 4 1 5 0"/>',
     # Annotation-only icons; previously these names fell back to generic dots.
     'mouse-pointer-2': '<path d="M4 3l14 9-7 1-3 7z M11 13l4 7"/>',
+    # Thick, crisp I-beam; uses the same scalable SVG rendering as other toolbar icons.
+    'text-cursor-bold': '<path d="M8 3h8 M12 3v18 M8 21h8" stroke-width="3.4"/>',
+    'scissors': '<circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><path d="M8 8l13 13 M8 16L21 3"/>',
     'hand': '<path d="M7 12V7a1.5 1.5 0 0 1 3 0v3-5a1.5 1.5 0 0 1 3 0v5-4a1.5 1.5 0 0 1 3 0v5-2a1.5 1.5 0 0 1 3 0v6c0 3-2 5-5 5h-4c-2 0-3-1-4-3l-3-4a1.6 1.6 0 0 1 3-2l2 2"/>',
     'shapes': '<rect x="2" y="9" width="11" height="11" rx="0"/><circle cx="16.5" cy="7" r="4.5"/><path d="M14 20l3-5 4 5z"/>',
     'eraser': '<path d="m8 4 12 12-5 5H7l-5-5z M5 19l9-10 M11 21h10"/>',

@@ -1,4 +1,4 @@
-"""Prevent a silent mismatch between v0.8.2 binaries and their release metadata."""
+"""Prevent release version mismatches when preparing Yomu Note v0.8.3b."""
 from pathlib import Path
 
 from yomunote import __version__
@@ -11,29 +11,29 @@ def read(path):
 
 
 def test_version_and_windows_upgrade_id():
-    assert __version__ == '0.8.2'
+    assert __version__ == '0.8.3b'
     iss = read('YomuNote_v050_Installer.iss')
-    assert '#define MyAppVersion "0.8.2"' in iss
-    assert 'VersionInfoVersion=0.8.2.0' in iss
-    assert 'OutputBaseFilename=YomuNote_Setup_v0.8.2' in iss
+    assert '#define MyAppVersion "0.8.3b"' in iss
+    assert 'VersionInfoVersion=0.8.3.2' in iss
+    assert 'OutputBaseFilename=YomuNote_Setup_v0.8.3b' in iss
     # Preserve the stable Inno Setup AppId so upgrades use the same installation.
     assert 'AppId={{974AD665-3F47-4CC5-9AAE-0A5F43565469}' in iss
-    assert 'YomuNote_Setup_v0.8.2.exe' in read('build-installer-windows.ps1')
+    assert 'YomuNote_Setup_v0.8.3b.exe' in read('build-installer-windows.ps1')
 
 
 def test_release_asset_names_agree_with_builders():
     workflow = read('.github/workflows/release.yml')
     for name in (
-        'YomuNote_Setup_v0.8.2.exe',
-        'YomuNote-0.8.2-macOS-arm64-unsigned.dmg',
-        'YomuNote-0.8.2-macOS-x86_64-unsigned.dmg',
+        'YomuNote_Setup_v0.8.3b.exe',
+        'YomuNote-0.8.3b-macOS-arm64-unsigned.dmg',
+        'YomuNote-0.8.3b-macOS-x86_64-unsigned.dmg',
     ):
         assert name in workflow
     assert '--draft --prerelease' in workflow
-    assert '--notes-file RELEASE_NOTES_v0.8.2.md' in workflow
+    assert '--notes-file RELEASE_NOTES_v0.8.3b.md' in workflow
     assert 'needs: [windows, macos]' in workflow
-    assert 'version="0.8.2"' in read('scripts/package-macos-dmg.sh')
-    assert 'YomuNote_Setup_v0.8.2.exe' in read('RELEASE_NOTES_v0.8.2.md')
+    assert 'version="0.8.3b"' in read('scripts/package-macos-dmg.sh')
+    assert 'YomuNote_Setup_v0.8.3b.exe' in read('RELEASE_NOTES_v0.8.3b.md')
 
 
 def test_readme_keeps_existing_published_installer_live_until_new_one_is_published():

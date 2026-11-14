@@ -8,6 +8,7 @@ from __future__ import annotations
 from . import __version__
 
 import sys
+import os
 import json
 import math
 import copy
@@ -78,6 +79,7 @@ from .layout_geometry import fit_inside, is_near_native_pixel_ratio
 from .tab_strip import inline_add_position
 from .ocr_engine import (MAX_REGIONS, OCR_DPI, find_tesseract, installed_languages,
                          recognise_regions, OCRCancelled)
+from .pdf_text_engine import inspect_page
 
 THUMB_LIMIT = 20
 # Only one large page pixmap stays in RAM. Adjacent pages are pre-rendered on disk.
@@ -616,6 +618,13 @@ class AmbientPanel(QWidget):
         gradient.setColorAt(.50, QColor(base))
         gradient.setColorAt(1, QColor(blend_colour(base, c['accent2'], .04)))
         painter.fillRect(self.rect(), gradient)
+        if getattr(self, '_yomu_focus_active', False):
+            colour = QColor(c['accent'])
+            colour.setAlpha(230)
+            pen = QPen(colour, 3.5)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.rect().adjusted(2, 2, -3, -3))
         painter.end()
 
 
@@ -1216,6 +1225,7 @@ class ImageCanvas(QGraphicsView):
     zoomChanged = Signal(float, bool)  # actual displayed scale, Fit state
     ocrRegionsChanged = Signal(int)
     ocrCancelRequested = Signal()
+    textHighlightCreated = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -1271,12 +1281,14 @@ class ImageCanvas(QGraphicsView):
         self.tool_styles['arrow']['head_length'] = .025
         # All three new Multiply highlighter tools start at 100% opacity.
         # Existing saved strokes/highlights keep their original stored alpha.
-        self.tool_styles['marker'] = {'color': self.highlight_color, 'opacity': 100,
+        self.tool_styles['marker'] = {'color': self.highlight_color, 'opacity': 80,
                                        'width': .009, 'fill': None}
         self.tool_styles['highlight'] = {'color': self.highlight_color,
-                                          'opacity': 100, 'width': .013}
+                                           'opacity': 80, 'width': .013}
         self.tool_styles['highlight_line'] = {'color': self.highlight_color,
-                                               'opacity': 100, 'width': .013}
+                                                'opacity': 80, 'width': .013}
+        self.tool_styles['highlight_area'] = {'color': self.highlight_color,
+                                                'opacity': 80, 'width': .013}
         self._shape_origin = None
         self._shape_preview = None
         self._shape_end = None
@@ -1312,6 +1324,16 @@ class ImageCanvas(QGraphicsView):
         self._ocr_mask.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.canvas_scene.addItem(self._ocr_mask)
         self._ocr_mask.setVisible(False)
+        # v0.8.3a: disposable geometry and overlay; no extra PDF bitmap.
+        self._text_geometry = None
+        self._text_anchor = None
+        self._text_endpoint = None
+        self._text_dragging = False
+        self._text_overlay = QGraphicsPathItem()
+        self._text_overlay.setZValue(101)
+        self._text_overlay.setPen(QPen(Qt.PenStyle.NoPen))
+        self._text_overlay.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.canvas_scene.addItem(self._text_overlay)
         self._ocr_outline_items = []
         self._ocr_colour = QColor('#22a998')
         self._zoom_factor = 1.0
@@ -1418,13 +1440,106 @@ class ImageCanvas(QGraphicsView):
 
         start_task(self, worker, complete, priority=-1)
 
+    # --- v0.8.3a: native PDF text selection, independent of raster preview ---
+    def clear_text_selection(self, drop_geometry=False):
+        self._text_anchor = None
+        self._text_endpoint = None
+        self._text_dragging = False
+        self._text_overlay.setPath(QPainterPath())
+        if drop_geometry:
+            self._text_geometry = None
+
+    def set_text_geometry(self, geometry):
+        self.clear_text_selection(drop_geometry=True)
+        self._text_geometry = geometry
+        self._update_text_cursor()
+
+    def _using_native_text(self):
+        return (self._text_geometry is not None and
+                self.annotation_tool in ('text_select', 'highlight'))
+
+    def _text_mouse_index(self, viewport_point):
+        if not self._using_native_text():
+            return None
+        bounds = self._page_bounds()
+        if bounds.isEmpty():
+            return None
+        point = self._clamp_scene(viewport_point)
+        return self._text_geometry.nearest(point.x()/bounds.width(),
+                                           point.y()/bounds.height())
+
+    def _start_text_drag(self, viewport_point):
+        if not self._using_native_text():
+            return False
+        index = self._text_mouse_index(viewport_point)
+        self.clear_text_selection()
+        if index is None:
+            return False
+        self._text_anchor = index
+        self._text_endpoint = index
+        self._text_dragging = True
+        self._refresh_text_selection()
+        self.setFocus()
+        return True
+
+    def _update_text_drag(self, viewport_point):
+        if not self._text_dragging:
+            return
+        idx = self._text_mouse_index(viewport_point)
+        if idx is not None and idx != self._text_endpoint:
+            self._text_endpoint = idx
+            self._refresh_text_selection()
+
+    def _refresh_text_selection(self):
+        g = self._text_geometry
+        if (g is None or self._text_anchor is None or
+                self._text_endpoint is None):
+            self._text_overlay.setPath(QPainterPath())
+            return
+        bounds = self._page_bounds()
+        path = QPainterPath()
+        if not bounds.isEmpty():
+            for x, y, w, h in g.boxes(self._text_anchor, self._text_endpoint):
+                path.addRect(QRectF(x*bounds.width(), y*bounds.height(),
+                                    w*bounds.width(), h*bounds.height()))
+        self._text_overlay.setPath(path)
+        shade = (QColor(self._tool_style('highlight')['color'])
+                 if self.annotation_tool == 'highlight' else QColor('#5e9ddd'))
+        shade.setAlpha(105 if self.annotation_tool == 'highlight' else 90)
+        self._text_overlay.setBrush(QBrush(shade))
+
+    def _finish_text_drag(self, viewport_point):
+        if not self._text_dragging:
+            return
+        self._update_text_drag(viewport_point)
+        self._text_dragging = False
+        if (self.annotation_tool == 'highlight' and
+                self._text_anchor is not None and self._text_endpoint is not None
+                and self._text_anchor != self._text_endpoint):
+            boxes = self._text_geometry.boxes(self._text_anchor, self._text_endpoint)
+            if boxes:
+                from .vector_marks import make_text_highlight
+                style = self._tool_style('highlight')
+                self.textHighlightCreated.emit(make_text_highlight(
+                    boxes, style['color'], style['opacity']))
+            self.clear_text_selection()
+
+    def _update_text_cursor(self):
+        if self._using_native_text():
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+        elif self.annotation_tool == 'pan':
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
     def set_highlighter(self, enabled):
         """Compatibility with the existing highlight colour-button behaviour."""
         self.set_annotation_tool('highlight' if enabled else 'pan')
 
     def set_annotation_tool(self, tool: str):
         self._cancel_eraser_drag()
-        if tool not in ('pan', 'ocr', 'highlight', 'highlight_line', 'pen', 'marker', 'select', 'eraser',
+        self.clear_text_selection()
+        if tool not in ('pan', 'ocr', 'text_select', 'highlight', 'highlight_area', 'highlight_line', 'pen', 'marker', 'select', 'eraser',
                         'line', 'arrow', 'rectangle', 'ellipse'):
             raise ValueError('Unsupported annotation tool')
         if self._live_stroke is not None and self._live_stroke in self._marks:
@@ -1450,15 +1565,14 @@ class ImageCanvas(QGraphicsView):
         self.annotation_tool = tool
         self._ocr_mask.setVisible(tool == 'ocr')
         self._refresh_ocr_overlay()
-        self.highlight_mode = tool in ('highlight', 'highlight_line')
+        self.highlight_mode = tool in ('highlight', 'highlight_area', 'highlight_line')
         self._highlight_origin = None
         self._stroke_points = None
         self._stroke_drag_start = None
         self.annotationSelected.emit(-1, None)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if tool == 'pan'
                          else QGraphicsView.DragMode.NoDrag)
-        self.viewport().setCursor(Qt.CursorShape.ArrowCursor if tool == 'pan'
-                                  else Qt.CursorShape.CrossCursor)
+        self._update_text_cursor()
 
     def clear_marks(self):
         self._cancel_eraser_drag()
@@ -1533,8 +1647,13 @@ class ImageCanvas(QGraphicsView):
         bounds = self._page_bounds()
         if mark['kind'] == 'highlight':
             path = QPainterPath()
-            path.addRect(QRectF(mark['x'] * bounds.width(), mark['y'] * bounds.height(),
-                                mark['w'] * bounds.width(), mark['h'] * bounds.height()))
+            if mark.get('segments'):
+                for x, y, w, h in mark['segments']:
+                    path.addRect(QRectF(x*bounds.width(), y*bounds.height(),
+                                        w*bounds.width(), h*bounds.height()))
+            else:
+                path.addRect(QRectF(mark['x'] * bounds.width(), mark['y'] * bounds.height(),
+                                    mark['w'] * bounds.width(), mark['h'] * bounds.height()))
             return path
         p1 = QPointF(mark['x1'] * bounds.width(), mark['y1'] * bounds.height())
         p2 = QPointF(mark['x2'] * bounds.width(), mark['y2'] * bounds.height())
@@ -1964,6 +2083,17 @@ class ImageCanvas(QGraphicsView):
         self.ocrRegionsChanged.emit(len(self._ocr_regions))
 
     def keyPressEvent(self, event):
+        if (self.annotation_tool == "text_select" and
+                self._text_geometry is not None and
+                self._text_anchor is not None and
+                self._text_endpoint is not None and
+                event.matches(QKeySequence.StandardKey.Copy)):
+            text = self._text_geometry.selected_text(
+                self._text_anchor, self._text_endpoint)
+            if text:
+                QApplication.clipboard().setText(text)
+            event.accept()
+            return
         if self.annotation_tool == 'ocr':
             if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
                 self.undo_ocr_region()
@@ -1979,11 +2109,40 @@ class ImageCanvas(QGraphicsView):
                 return
         super().keyPressEvent(event)
 
+    def contextMenuEvent(self, event):
+        if (self._text_geometry is not None and
+                self._text_anchor is not None and self._text_endpoint is not None and
+                self._text_anchor != self._text_endpoint and
+                self.annotation_tool == 'text_select'):
+            menu = QMenu(self)
+            copy_action = menu.addAction('Copy Text')
+            highlight_action = menu.addAction('Highlight Text')
+            choice = menu.exec(event.globalPos())
+            if choice == copy_action:
+                text = self._text_geometry.selected_text(
+                    self._text_anchor, self._text_endpoint)
+                if text:
+                    QApplication.clipboard().setText(text)
+            elif choice == highlight_action:
+                boxes = self._text_geometry.boxes(
+                    self._text_anchor, self._text_endpoint)
+                if boxes:
+                    from .vector_marks import make_text_highlight
+                    style = self._tool_style('highlight')
+                    self.textHighlightCreated.emit(make_text_highlight(
+                        boxes, style['color'], style['opacity']))
+            event.accept()
+            return
+        super().contextMenuEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.image_item.pixmap().isNull():
             point = self._clamp_scene(event.position().toPoint())
             bounds = self._page_bounds()
             if bounds.isEmpty():
+                event.accept()
+                return
+            if self._start_text_drag(event.position().toPoint()):
                 event.accept()
                 return
             if self.annotation_tool == 'ocr':
@@ -2048,7 +2207,7 @@ class ImageCanvas(QGraphicsView):
                 self.annotationSelected.emit(-1, None)
                 event.accept()
                 return
-            if self.annotation_tool == 'highlight':
+            if self.annotation_tool in ('highlight', 'highlight_area'):
                 self._highlight_origin = point
                 self._live_highlight = self._mark_rect(
                     QRectF(point, point), self._tool_style('highlight')['color'],
@@ -2100,6 +2259,10 @@ class ImageCanvas(QGraphicsView):
         return mark
 
     def mouseMoveEvent(self, event):
+        if self._text_dragging:
+            self._update_text_drag(event.position().toPoint())
+            event.accept()
+            return
         if self._ocr_dragging:
             self._ocr_update_drag(event.position().toPoint())
             event.accept()
@@ -2167,6 +2330,10 @@ class ImageCanvas(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._text_dragging and event.button() == Qt.MouseButton.LeftButton:
+            self._finish_text_drag(event.position().toPoint())
+            event.accept()
+            return
         if self._ocr_dragging and event.button() == Qt.MouseButton.LeftButton:
             self._ocr_finish_drag(event.position().toPoint())
             event.accept()
@@ -2274,7 +2441,7 @@ class ImageCanvas(QGraphicsView):
             rect = self._live_highlight.rect()
             bounds = self._page_bounds()
             if rect.width() >= 3 and rect.height() >= 3 and not bounds.isEmpty():
-                style = self._tool_style('highlight')
+                style = self._tool_style(self.annotation_tool)
                 self.highlightCreated.emit(make_highlight(
                     (rect.left()/bounds.width(), rect.top()/bounds.height(),
                      rect.width()/bounds.width(), rect.height()/bounds.height()),
@@ -2407,6 +2574,7 @@ class ImageCanvas(QGraphicsView):
 
     def show_image(self, path: Path | None):
         self.clear_ocr_regions()
+        self.clear_text_selection(drop_geometry=True)
         # QPixmap(path) implicitly populates Qt's process-global pixmap cache.
         # QImageReader -> QPixmap avoids that hidden second copy. Clearing the
         # scene item then actually releases the active page's large bitmap.
@@ -2840,6 +3008,12 @@ class ProjectPane(QWidget):
         self.group_tree.collapseChanged.connect(self._group_collapse_changed)
         self.group_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.group_tree.customContextMenuRequested.connect(self.group_context_menu)
+        self.group_delete_shortcuts = []
+        for key in ('Delete', 'Backspace'):
+            shortcut = QShortcut(QKeySequence(key), self.group_tree)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(self.remove_page)
+            self.group_delete_shortcuts.append(shortcut)
         self.nav_views.addWidget(self.group_tree)
         self.nav_view_buttons = QWidget()
         nav_switch = QHBoxLayout(self.nav_view_buttons)
@@ -2958,12 +3132,58 @@ class ProjectPane(QWidget):
         self.preview_zoom_label.setMinimumWidth(86)
         self.preview_zoom_label.setToolTip('Live document zoom · smart on-demand preview below 100%, smooth scaling above 100%')
         controls.addWidget(self.preview_zoom_label)
-        self._ocr_entry_action = controls.addAction('✂ OCR')
-        self._ocr_entry_action.setToolTip('Extract text from PDF/image: draw several rectangles, scroll, recognise and copy')
+        # YOMU_V083B_TEXT_INTEGRATION: keep the two text modes together.
+        self._ocr_entry_action = QAction('OCR', self)
+        self._ocr_entry_action.setToolTip('Extract text from scanned pages or images')
         self._ocr_entry_action.triggered.connect(self.enter_ocr_mode)
-        cl.addWidget(controls)
+        self._text_select_action = QAction('Select Text', self)
+        self._text_select_action.setCheckable(True)
+        self._text_select_action.setIcon(line_icon('text-cursor-bold'))
+        self._text_select_action.triggered.connect(
+            lambda _checked=False: self.set_annotation_mode('text_select'))
+        self._text_select_action.setEnabled(False)
+        self._text_select_holder = QWidget(self)
+        self._text_select_holder.setToolTip('No text layer available on this page')
+        text_holder_layout = QHBoxLayout(self._text_select_holder)
+        text_holder_layout.setContentsMargins(0, 0, 0, 0)
+        text_holder_layout.setSpacing(0)
+        self._text_select_button = QToolButton(self._text_select_holder)
+        self._text_select_button.setDefaultAction(self._text_select_action)
+        self._text_select_button.setAutoRaise(False)
+        self._text_select_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._text_select_button.setIconSize(QSize(20, 20))
+        self._text_select_button.setAccessibleName('Select Text')
+        self._text_select_button.setToolTip('No text layer available on this page')
+        text_holder_layout.addWidget(self._text_select_button)
+        self._ocr_button = QToolButton(self)
+        self._ocr_button.setDefaultAction(self._ocr_entry_action)
+        self._ocr_button.setIcon(line_icon('scissors'))
+        self._ocr_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._ocr_button.setIconSize(QSize(20, 20))
+        self._ocr_button.setAccessibleName('OCR')
+        self._text_mode_group = QWidget(self)
+        group_box = QVBoxLayout(self._text_mode_group)
+        group_box.setContentsMargins(2, 0, 2, 0)
+        group_box.setSpacing(2)
+        self._text_mode_label = QLabel('Text selection modes')
+        self._text_mode_label.setObjectName('hintLabel')
+        self._text_mode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        group_box.addWidget(self._text_mode_label)
+        mode_buttons = QHBoxLayout()
+        mode_buttons.setContentsMargins(0, 0, 0, 0)
+        mode_buttons.setSpacing(4)
+        mode_buttons.addWidget(self._text_select_holder)
+        mode_buttons.addWidget(self._ocr_button)
+        group_box.addLayout(mode_buttons)
+        self._preview_tools_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._preview_tools_row.setContentsMargins(0, 0, 0, 0)
+        self._preview_tools_row.setSpacing(4)
+        self._preview_tools_row.addWidget(controls, 1)
+        self._preview_tools_row.addWidget(self._text_mode_group, 0, Qt.AlignmentFlag.AlignRight)
+        cl.addLayout(self._preview_tools_row)
         self.canvas.filesDropped.connect(lambda paths: self.import_paths(paths, len(self.project.pages)))
         self.canvas.highlightCreated.connect(self.add_highlight)
+        self.canvas.textHighlightCreated.connect(self.add_text_highlight)
         self.canvas.strokeCreated.connect(self.add_stroke)
         self.canvas.strokeMoved.connect(self.move_stroke)
         self.canvas.strokeEraseRequested.connect(self.erase_stroke)
@@ -3079,7 +3299,7 @@ class ProjectPane(QWidget):
         self.annotation_mode_buttons = {}
         self._annotation_groups = {
             'drawing': ('pen', 'line', 'arrow', 'rectangle', 'ellipse'),
-            'highlight': ('marker', 'highlight', 'highlight_line'),
+            'highlight': ('marker', 'highlight', 'highlight_area', 'highlight_line'),
             'erase': ('eraser',),
         }
         self._annotation_last_tool = {'drawing': 'pen',
@@ -3143,16 +3363,20 @@ class ProjectPane(QWidget):
         self.highlight_button = LabelledHighlightButton()
         self.highlight_button.set_colour(self.project.highlight_color)
         self.canvas.highlight_color = self.project.highlight_color
-        for name in ('highlight', 'highlight_line', 'marker'):
+        for name in ('highlight', 'highlight_area', 'highlight_line', 'marker'):
             self.canvas.tool_styles[name]['color'] = self.project.highlight_color
         self.highlight_button.setProperty('annotationIconName', 'highlighter')
         self.highlight_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self.highlight_button.setToolTip('Highlight · click to use, ▾ to choose a mode, right-click for appearance')
+        self.highlight_button.setToolTip('Text-aware highlight on readable PDFs · area highlight otherwise; ▾ for other modes')
         self.highlight_menu = QMenu(self.highlight_button)
-        for label, tool in (('🖍 Freehand Multiply marker', 'marker'),
-                            ('▭ Rectangle highlight', 'highlight'),
+        for label, tool in (('✎ Text-aware highlight (auto fallback)', 'highlight'),
+                            ('▭ Area highlight', 'highlight_area'),
+                            ('🖍 Freehand Multiply marker', 'marker'),
                             ('━ Straight-line highlight', 'highlight_line')):
-            self.highlight_menu.addAction(label, lambda _checked=False, t=tool: self.set_annotation_mode(t))
+            action = self.highlight_menu.addAction(
+                label, lambda _checked=False, t=tool: self.set_annotation_mode(t))
+            if tool == 'highlight':
+                self._text_highlight_menu_action = action
         self.highlight_button.setMenu(self.highlight_menu)
         self.highlight_button.clicked.connect(
             lambda: self.set_annotation_mode(self._annotation_last_tool['highlight']))
@@ -3587,6 +3811,9 @@ class ProjectPane(QWidget):
         self.splitter.addWidget(notes_backdrop)
         self._panel_widgets = {'pages': self.shelf, 'preview': self.canvas_panel,
                                'notes': self.notes_backdrop}
+        # Never intercept focus or key events: a visual-only frame.
+        self._yomu_active_column = None
+        QApplication.instance().focusChanged.connect(self._yomu_focus_column_changed)
         # Older projects have no panel_order and open in classic mode. New
         # projects restore all six arrangements without changing format v4.
         self.apply_panel_order(project.panel_order, initializing=True)
@@ -4121,6 +4348,24 @@ class ProjectPane(QWidget):
 
             start_task(self, worker, complete, priority=-1)
 
+    def _yomu_focus_column_changed(self, old=None, new=None):
+        """Subtle theme-coloured frame shows where keyboard actions will land."""
+        if not hasattr(self, '_panel_widgets'):
+            return
+        column = None
+        for key, panel in self._panel_widgets.items():
+            if new is not None and (new is panel or panel.isAncestorOf(new)):
+                column = key
+                break
+        if column is None and new is None:
+            column = self._yomu_active_column  # Transient native menu focus.
+        self._yomu_active_column = column
+        for key, panel in self._panel_widgets.items():
+            active = key == column and self._active
+            if getattr(panel, '_yomu_focus_active', False) != active:
+                panel._yomu_focus_active = active
+                panel.update()
+
     def set_navigation_view(self, view, *, persist=True):
         """Switch views while preserving the actual reading page."""
         self._navigator_view = view
@@ -4466,8 +4711,12 @@ class ProjectPane(QWidget):
                 lambda _=False, k=kind, pid=identifier, value=not checked:
                 self._toggle_read_status(k, pid, value))
             if kind == 'page':
-                menu.addAction('Remove this page…',
-                    lambda _=False, pid=identifier: self.remove_page_ids_confirmed([pid]))
+                chosen = self.group_tree.selected_page_ids()
+                menu.addAction(
+                    f'Remove {len(chosen)} selected pages…' if len(chosen) > 1
+                    else 'Remove this page…',
+                    self.remove_page if len(chosen) > 1
+                    else (lambda _=False, pid=identifier: self.remove_page_ids_confirmed([pid])))
             menu.addSeparator()
         menu.addAction('New group…', lambda: self.create_page_group(root=True))
         menu.addAction('Group selected pages…', self.group_selected_pages)
@@ -4544,6 +4793,7 @@ class ProjectPane(QWidget):
         self._thumb_pending.clear()
         self._wanted_thumbnail_ids = frozenset()
         self.canvas.show_image(None)
+        self._sync_text_select_availability()
         self._view_restoring = False
 
     def select_page_id(self, page_id: str):
@@ -4594,6 +4844,7 @@ class ProjectPane(QWidget):
         self._quality_level = 1.0
         token = self._preview_token
         self.canvas.show_image(None)
+        self._sync_text_select_availability()
         page = self.current_page()
         if not page or not self._active:
             self._view_restoring = False
@@ -4617,7 +4868,9 @@ class ProjectPane(QWidget):
                     self._clarity_token += 1
                     self._clarity_applied_signature = None
                     self.canvas.set_annotations(self.project.annotations.get(page['id'], []))
+                    self._load_native_text_for_page(page, token)
                     self._view_displayed_page_id = page['id']
+                    self._sync_text_select_availability()
                     # Defer until layout/scroll ranges are stable; stale
                     # callbacks are rejected using the render token.
                     QTimer.singleShot(0, lambda pid=page['id'], ticket=token:
@@ -4631,6 +4884,30 @@ class ProjectPane(QWidget):
                     self._view_restoring = False
                     self.statusMessage.emit('Could not decode the cached page preview.')
         start_task(self, worker, done, priority=3)
+
+    def _load_native_text_for_page(self, page, token):
+        """One stale-safe background probe; never touches existing OCR/bitmaps."""
+        if page.get('kind') != 'pdf':
+            return
+        page_id = page['id']
+        source = self.project.asset_path(page['render_source'])
+        source_page = int(page['source_page'])
+        def worker():
+            if token != self._preview_token or not self._active:
+                return None
+            return inspect_page(source, source_page)
+        def done(geometry, error):
+            if (token != self._preview_token or not self._active or
+                    not self.current_page() or
+                    self.current_page()['id'] != page_id):
+                return
+            if error:
+                self.canvas.set_text_geometry(None)
+                self._sync_text_select_availability()
+                return  # Preview and OCR remain fully functional.
+            self.canvas.set_text_geometry(geometry)
+            self._sync_text_select_availability()
+        start_task(self, worker, done, priority=1)
 
     def prefetch_neighbours(self, token):
         row = self.pages_list.currentRow()
@@ -5419,11 +5696,35 @@ class ProjectPane(QWidget):
         self.schedule_save()
 
     def selected_pages(self):
-        items = self.pages_list.selectedItems()
-        if not items and self.pages_list.currentItem():
-            items = [self.pages_list.currentItem()]
-        ids = {item.data(Qt.ItemDataRole.UserRole) for item in items}
+        """Return every selected page in reading order from the VISIBLE list."""
+        if self._navigator_view == 'groups':
+            # Never delete an unrelated preview page when only a group is
+            # selected or the tree has no selected pages.
+            ids = set(self.group_tree.selected_page_ids())
+        else:
+            items = self.pages_list.selectedItems()
+            if not items and self.pages_list.currentItem():
+                items = [self.pages_list.currentItem()]
+            ids = {item.data(Qt.ItemDataRole.UserRole) for item in items}
         return [(i, p) for i, p in enumerate(self.project.pages) if p['id'] in ids]
+
+    def _restore_removed_page_selection(self, tree, pages, selected, deleted_ids, nav_view):
+        """Undo a multi-delete as one step and restore its multi-selection."""
+        self._apply_group_snapshot(tree, pages, selected)
+        if nav_view == 'groups':
+            self.group_tree.clearSelection()
+            for pid in deleted_ids:
+                item = self.group_tree.find_item('page', pid)
+                if item is not None:
+                    item.setSelected(True)
+        else:
+            with QSignalBlocker(self.pages_list):
+                self.pages_list.clearSelection()
+                desired = set(deleted_ids)
+                for row in range(self.pages_list.count()):
+                    item = self.pages_list.item(row)
+                    if item.data(Qt.ItemDataRole.UserRole) in desired:
+                        item.setSelected(True)
 
     def page_context_menu(self, position):
         item = self.pages_list.itemAt(position)
@@ -5504,14 +5805,15 @@ class ProjectPane(QWidget):
         before_tree = copy.deepcopy(self.project.page_groups)
         selected_id = self.project.selected_page
         ids = [page['id'] for _index, page in selected]
+        original_view = self._navigator_view
         remaining = [p for p in before_pages if p['id'] not in ids]
         after_tree = reconcile_group_tree(
             before_tree, [p['id'] for p in remaining])
         self._separate_text_commands()
         self.history.perform(CallbackAction(
             'Remove Pages',
-            lambda: self._apply_group_snapshot(
-                before_tree, before_pages, selected_id),
+            lambda: self._restore_removed_page_selection(
+                before_tree, before_pages, selected_id, ids, original_view),
             lambda: self._apply_group_snapshot(
                 after_tree, remaining, selected_id),
             512 + 140 * len(ids)))
@@ -6014,7 +6316,48 @@ class ProjectPane(QWidget):
         layout.addLayout(buttons)
         dialog.exec()
 
+    def _sync_text_select_availability(self):
+        """Reflect ONLY the current displayed page's loaded text geometry."""
+        if not hasattr(self, '_text_select_action'):
+            return
+        page = self.current_page()
+        available = bool(page and self._active and
+                         self._view_displayed_page_id == page['id'] and
+                         self.canvas._text_geometry is not None)
+        self._text_select_action.setEnabled(available)
+        if hasattr(self, '_text_highlight_menu_action'):
+            self._text_highlight_menu_action.setEnabled(available)
+        if available and getattr(self, '_auto_area_due_to_no_text', False):
+            self._auto_area_due_to_no_text = False
+            if self.canvas.annotation_tool == 'highlight_area':
+                self.set_annotation_mode('highlight')
+        elif not available and self.canvas.annotation_tool == 'highlight':
+            self._auto_area_due_to_no_text = True
+            self._yomu_auto_area_switch = True
+            try:
+                self.set_annotation_mode('highlight_area')
+            finally:
+                self._yomu_auto_area_switch = False
+        hint = ('Select Text: drag across words, then Ctrl+C / Cmd+C to copy'
+                if available else 'No text layer available on this page')
+        self._text_select_action.setToolTip(hint)
+        self._text_select_button.setToolTip(hint)
+        # The holder is not disabled. It keeps the unavailable tooltip visible
+        # even though Qt does not send ordinary pointer events to disabled UI.
+        self._text_select_holder.setToolTip(hint)
+        if not available and self.canvas.annotation_tool == 'text_select':
+            self.set_annotation_mode('pan')
+        self._text_select_action.setChecked(
+            available and self.canvas.annotation_tool == 'text_select')
+
     def set_annotation_mode(self, tool):
+        if tool == 'text_select' and not self._text_select_action.isEnabled():
+            return
+        if tool == 'highlight' and not self._text_select_action.isEnabled():
+            tool = 'highlight_area'
+            self._auto_area_due_to_no_text = True
+        elif tool == 'highlight_area' and not getattr(self, '_yomu_auto_area_switch', False):
+            self._auto_area_due_to_no_text = False
         if self.canvas.annotation_tool == 'ocr' and tool != 'ocr':
             self.leave_ocr_mode(set_pan=False)
         self.canvas.set_annotation_tool(tool)
@@ -6022,6 +6365,7 @@ class ProjectPane(QWidget):
         self._update_annotation_toolbar_layout()
         for name, button in self.annotation_mode_buttons.items():
             button.setChecked(name == tool)
+        self._text_select_action.setChecked(tool == 'text_select')
         for group, members in self._annotation_groups.items():
             self._annotation_group_buttons[group].setChecked(tool in members)
             if tool in members:
@@ -6035,10 +6379,12 @@ class ProjectPane(QWidget):
             'rectangle': 'Rectangle: drag to draw · Shift makes a square.',
             'ellipse': 'Ellipse: drag to draw · Shift makes a circle.',
             'select': 'Select: click a mark to edit colour/opacity/thickness; drag or resize.',
+            'text_select': 'Select Text: drag over PDF text, then Ctrl+C / Cmd+C to copy.',
             'eraser': 'Eraser: hold the left mouse button and sweep across annotations; one Undo restores the gesture.',
             'pan': 'Pan: drag to move the page.',
             'ocr': 'OCR: draw one or more rectangles, scroll to continue, then Recognise.',
-            'highlight': 'Rectangle highlighter: drag across a passage · Multiply.',
+            'highlight': 'Text-aware highlighter: drag across words; falls back to rectangle on image-only pages.',
+            'highlight_area': 'Area highlighter: drag a rectangle, including over images and scans.',
             'highlight_line': 'Straight-line highlighter: drag a flat-ended line · Shift snaps.',
         }[tool])
 
@@ -6051,7 +6397,7 @@ class ProjectPane(QWidget):
         selected = self._appearance_selection_mark
         if selected is not None and selected.get('kind') in ('highlight', 'highlight_line'):
             return 'highlight'
-        if selected is None and self.canvas.annotation_tool in ('highlight', 'highlight_line'):
+        if selected is None and self.canvas.annotation_tool in ('highlight', 'highlight_area', 'highlight_line'):
             return 'highlight'
         return self._palette_channel
 
@@ -6222,6 +6568,26 @@ class ProjectPane(QWidget):
         self.canvas.editingGesture.connect(self._annotation_editing_gesture)
         self.canvas.viewport().installEventFilter(self)
 
+    def _update_text_mode_group_layout(self):
+        """Responsive pair: identical sizes; swap to a row below on narrow pages."""
+        if not hasattr(self, '_text_mode_group'):
+            return
+        width = self.canvas.viewport().width()
+        narrow = width < 520
+        icon_only = width < 430
+        self._preview_tools_row.setDirection(
+            QBoxLayout.Direction.TopToBottom if narrow
+            else QBoxLayout.Direction.LeftToRight)
+        self._preview_tools_row.setAlignment(self._text_mode_group,
+                                            Qt.AlignmentFlag.AlignRight)
+        style = (Qt.ToolButtonStyle.ToolButtonIconOnly if icon_only else
+                 Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        button_width = 43 if icon_only else 104
+        for button in (self._text_select_button, self._ocr_button):
+            button.setToolButtonStyle(style)
+            button.setFixedSize(button_width, 29)
+        self._text_select_holder.setFixedSize(button_width, 29)
+
     def _update_annotation_toolbar_layout(self):
         """One-row toolbar: labelled, icon-only, then compact, then overflow.
 
@@ -6231,6 +6597,7 @@ class ProjectPane(QWidget):
         buttons = getattr(self, '_annotation_footer_buttons', None)
         if not buttons:
             return
+        self._update_text_mode_group_layout()
         pen_active = (getattr(self, 'pen_size_widget', None) is not None and
                       not self.pen_size_widget.isHidden())
         available = self.canvas.viewport().width() - (96 if pen_active else 0)
@@ -6574,7 +6941,7 @@ class ProjectPane(QWidget):
             style = self.canvas.tool_styles[tool]
             style['color'] = self.pen_colour.colour.name()
             style['opacity'] = self.stroke_opacity_control.value()
-            if tool != 'highlight':
+            if tool not in ('highlight', 'highlight_area'):
                 style['width'] = self.stroke_width_control.value()/1000
             if tool in ('rectangle', 'ellipse'):
                 style['stroke_enabled'] = self.stroke_enabled_checkbox.isChecked()
@@ -6583,7 +6950,7 @@ class ProjectPane(QWidget):
                 style['fill_opacity'] = self.fill_opacity_control.value()
             self.canvas.pen_color = style['color']
             self.canvas.pen_width = style['width']
-            if tool in ('highlight', 'highlight_line', 'marker'):
+            if tool in ('highlight', 'highlight_area', 'highlight_line', 'marker'):
                 self.canvas.highlight_color = style['color']
                 self.highlight_button.set_colour(style['color'])
                 self.project.highlight_color = style['color']
@@ -6624,7 +6991,7 @@ class ProjectPane(QWidget):
             if ((selected is None) or (selected.get('kind') not in ('highlight', 'highlight_line')
                                       and selected.get('blend') != 'multiply')):
                 self._set_highlight_defaults(color)
-                if selected is None and self.canvas.annotation_tool in ('highlight', 'highlight_line', 'marker'):
+                if selected is None and self.canvas.annotation_tool in ('highlight', 'highlight_area', 'highlight_line', 'marker'):
                     self._annotation_selection_changed(-1, None)
                 return
         if target == 'fill':
@@ -6645,7 +7012,7 @@ class ProjectPane(QWidget):
 
     def _set_highlight_defaults(self, color, opacity=None):
         """Explicit palette choice changes highlight presets, not a selected shape."""
-        for tool in ('highlight', 'highlight_line', 'marker'):
+        for tool in ('highlight', 'highlight_area', 'highlight_line', 'marker'):
             self.canvas.tool_styles[tool]['color'] = color
             if opacity is not None and tool != 'marker':
                 self.canvas.tool_styles[tool]['opacity'] = opacity
@@ -6681,7 +7048,7 @@ class ProjectPane(QWidget):
             if colour.isValid():
                 self._remember_recent_colour(colour.name())
                 self._set_highlight_defaults(colour.name())
-                if self.canvas.annotation_tool in ('highlight', 'highlight_line'):
+                if self.canvas.annotation_tool in ('highlight', 'highlight_area', 'highlight_line'):
                     self._annotation_selection_changed(-1, None)
             return
         if target == 'fill' and not self.shape_fill_checkbox.isEnabled():
@@ -6714,7 +7081,7 @@ class ProjectPane(QWidget):
         if colour.isValid():
             self._remember_recent_colour(colour.name())
             self._set_highlight_defaults(colour.name())
-            if self.canvas.annotation_tool in ('highlight', 'highlight_line'):
+            if self.canvas.annotation_tool in ('highlight', 'highlight_area', 'highlight_line'):
                 self._annotation_selection_changed(-1, None)
             self.schedule_save()
 
@@ -6733,6 +7100,10 @@ class ProjectPane(QWidget):
 
     def add_highlight(self, mark):
         self._add_vector(mark, 'Highlight Page', auto_select=True)
+
+    def add_text_highlight(self, mark):
+        # Keep the text highlighter engaged for repeated passages.
+        self._add_vector(mark, 'Highlight Text', auto_select=False)
 
     def _edit_stroke_marks(self, page_id, change):
         """Apply a compact stroke delta; snapshots never retain every stroke.
@@ -7189,11 +7560,21 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('Yomu Note  ·  よむ')
         self.resize(1450, 900)
         self.setMinimumSize(760, 600)
-        self.settings = QSettings('Yomu Note', 'Yomu Note')
+        self.settings = (QSettings('Yomu Note Integration Dev', 'Yomu Note Integration Dev')
+                         if os.environ.get('YOMU_INTEGRATION_DEV') == '1'
+                         else QSettings('Yomu Note', 'Yomu Note'))
+        # One-time seed: keep normal Yomu Note preferences READ-ONLY;
+        # never import recent/open notebook paths into this test build.
+        if os.environ.get('YOMU_INTEGRATION_DEV') == '1':
+            from .dev_preferences import import_from_user_preferences
+            import_from_user_preferences(
+                self.settings, QSettings('Yomu Note', 'Yomu Note'))
         # Import known preferences from the old app namespace once, without
         # modifying the original settings or reopening old project files.
         if not self.settings.value('preferencesMigrated', False, type=bool):
-            previous = QSettings('Sumi Study', 'Sumi Study')
+            previous = (QSettings('Yomu Dev Empty Legacy', 'Yomu Dev Empty Legacy')
+                        if os.environ.get('YOMU_INTEGRATION_DEV') == '1'
+                        else QSettings('Sumi Study', 'Sumi Study'))
             for key in ('theme', 'defaultFont', 'defaultFontSize', 'defaultBold',
                         'defaultItalic', 'defaultAlignment', 'lastOpenDir',
                         'lastSaveDir', 'recentProjects', 'openProjects'):
