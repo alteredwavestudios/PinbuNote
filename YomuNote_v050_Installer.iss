@@ -46,5 +46,6 @@ Source: "dist\Yomu Note\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdir
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
-[Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; Deliberately no [Run] application launch. The installer-launched first
+; process can inherit a different environment from a normal Start
+; menu launch. Close Setup before starting Yomu Note from Start.
