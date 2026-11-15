@@ -55,8 +55,8 @@ def _connect_readonly(source: Path):
     URI ``mode=ro`` prevents that dangerous surprise on typoed filenames.
     """
     path = Path(source).expanduser().resolve()
-    if not path.is_file() or path.suffix.lower() not in ('.yomunote', '.yominote'):
-        raise ValueError('Choose a supported .yomunote notebook file.')
+    if not path.is_file() or path.suffix.lower() not in ('.pinbunote', '.yomunote', '.yominote'):
+        raise ValueError('Choose a supported Pinbu Note or legacy Yomu Note notebook file.')
     # The SQLite URI, not a normal connect(), is essential: accidentally
     # creating a new file instead of reading the share must be impossible.
     return sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
@@ -402,8 +402,8 @@ def export_tabs(source: Path, destination: Path, tab_ids: list[str], cancel=None
     destination = Path(destination).expanduser().resolve()
     if source == destination or destination.exists():
         raise FileExistsError('Choose a NEW file name for the exported notebook.')
-    if destination.suffix.lower() != '.yomunote':
-        raise ValueError('Export file must use the .yomunote extension.')
+    if destination.suffix.lower() not in ('.pinbunote', '.yomunote'):
+        raise ValueError('Export file must use .pinbunote or .yomunote.')
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name('.' + destination.name + '.' + uuid.uuid4().hex + '.tmp')
     try:

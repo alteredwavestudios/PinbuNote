@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .vector_marks import valid_stroke, valid_shape, valid_highlight
+from .vector_marks import valid_stroke, valid_shape, valid_highlight, valid_photo, valid_sticky
 from .notes_layout import NotesPageSetup
 from .page_groups import validate as validate_page_groups, flat_tree, reconcile
 from .reading_progress import validated_read_ids
@@ -40,13 +40,15 @@ def safe_name(name: str) -> str:
     return name.strip(' .')[:90] or 'Untitled'
 
 
-def unique_project_path(parent: Path, name: str) -> Path:
+def unique_project_path(parent: Path, name: str, *, extension='.yomunote') -> Path:
     """Add a numeric suffix instead of overwriting an existing notebook."""
+    if extension not in ('.yomunote', '.pinbunote'):
+        raise ValueError('Unsupported notebook extension.')
     base = safe_name(name)
-    proposed = parent / f'{base}.yomunote'
+    proposed = parent / f'{base}{extension}' 
     number = 2
     while proposed.exists():
-        proposed = parent / f'{base} {number}.yomunote'
+        proposed = parent / f'{base} {number}{extension}'
         number += 1
     return proposed
 
@@ -206,6 +208,8 @@ class Project:
                 kind = mark.get('kind') if isinstance(mark, dict) else None
                 valid = (valid_stroke(mark) if kind == 'stroke' else
                          valid_shape(mark) if kind == 'shape' else
+                         valid_photo(mark, verify_data=True) if kind == 'photo' else
+                         valid_sticky(mark) if kind == 'sticky' else
                          valid_highlight(mark))
                 if valid:
                     valid_marks.append(mark)
@@ -219,6 +223,8 @@ class Project:
                     raise ValueError(
                         'Invalid vector stroke.' if kind == 'stroke' else
                         'Invalid vector shape.' if kind == 'shape' else
+                        'Invalid photo annotation.' if kind == 'photo' else
+                        'Invalid sticky note.' if kind == 'sticky' else
                         'Invalid highlight annotation.')
             clean_annotations[page_id] = valid_marks
         annotations = clean_annotations
@@ -234,6 +240,13 @@ class Project:
             seen_page_ids.add(page['id'])
             if not isinstance(page.get('title', ''), str):
                 raise ValueError('Invalid page title.')
+            bookmark = page.get('bookmark')
+            if bookmark is not None and (not isinstance(bookmark, str) or
+                                         not 1 <= len(bookmark) <= 120):
+                if recover_cosmetic:
+                    page.pop('bookmark', None)
+                else:
+                    raise ValueError('Invalid page bookmark.')
             source_page = page.get('source_page')
             if source_page is not None and (
                     type(source_page) is not int or not 1 <= source_page <= 20000):
@@ -334,6 +347,11 @@ class Project:
     def save(self, *, prune_orphan_annotations: bool = False) -> None:
         if not valid_panel_order(self.panel_order):
             raise ValueError('Invalid saved panel order.')
+        for page in self.pages:
+            label = page.get('bookmark')
+            if label is not None and (not isinstance(label, str) or
+                                      not 1 <= len(label) <= 120):
+                raise ValueError('Invalid page bookmark.')
         self.path.mkdir(parents=True, exist_ok=True)
         # Verify every live page is represented exactly once before saving.
         # Keep the existing project format number: this is an optional

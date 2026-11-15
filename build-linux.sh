@@ -16,7 +16,7 @@ fi
 stage="$PWD/.build/ocr"
 .venv/bin/python ocr_packaging/prepare_ocr.py --target linux --output "$stage"
 .venv/bin/python -m PyInstaller --noconfirm --clean --windowed --onedir \
-  --name 'Yomu Note' --add-data 'assets:assets' \
+  --name 'Pinbu Note' --add-data 'assets:assets' \
   --add-data 'LICENSE:.' --add-data 'THIRD_PARTY_NOTICES.md:.' \
   --add-binary "$stage/tesseract:ocr" \
   --add-data "$stage/tessdata:ocr/tessdata" \
@@ -24,5 +24,5 @@ stage="$PWD/.build/ocr"
   --add-data "$stage/TESSERACT_APACHE_2.0.txt:ocr" \
   main.py
 .venv/bin/python ocr_packaging/verify_ocr_bundle.py \
-  --target linux --dist "$PWD/dist/Yomu Note"
-printf 'Built dist/Yomu Note/Yomu Note with local English OCR\n'
+  --target linux --dist "$PWD/dist/Pinbu Note"
+printf 'Built dist/Pinbu Note/Pinbu Note with local English OCR\n'

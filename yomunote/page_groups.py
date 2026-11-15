@@ -88,7 +88,9 @@ def validate(tree, page_ids) -> None:
                         or gid in seen_groups
                         or not isinstance(name, str)
                         or not 1 <= len(name.strip()) <= 120
-                        or type(node.get('collapsed')) is not bool):
+                        or type(node.get('collapsed')) is not bool
+                        or ('extra_vertical_scroll' in node and
+                            type(node['extra_vertical_scroll']) is not bool)):
                     raise ValueError('Invalid page group.')
                 seen_groups.add(gid)
                 walk(node.get('children'), depth + 1)
@@ -277,6 +279,9 @@ def reconcile(tree, page_ids):
                 group_id=group['id'] if reused else uuid4().hex,
                 collapsed=group['collapsed'] if reused else False,
             )
+            # Preserve optional per-group preview preferences on reordering.
+            if group.get('extra_vertical_scroll') is True:
+                folder['extra_vertical_scroll'] = True
             used_groups.add(group['id'])
             siblings = open_nodes[-1]['children'] if open_nodes else result
             siblings.append(folder)
@@ -415,4 +420,39 @@ def move_group(tree, group_id, parent_id=None, index=None):
         at = min(max(at, 0), len(destination))
     destination.insert(at, node)
     validate(result, flatten(tree))
+    return result
+
+
+def group_extra_vertical_scroll(tree, group_id):
+    """Whether this individual group explicitly enables page overscrolling."""
+    node = get_group(tree, group_id)
+    return bool(node and node.get('extra_vertical_scroll') is True)
+
+
+def page_extra_vertical_scroll(tree, page_id):
+    """A page inherits the choice of any enclosing group or subgroup."""
+    def visit(nodes, inherited=False):
+        for node in nodes or []:
+            if node.get('type') == 'page':
+                if node.get('page_id') == page_id:
+                    return bool(inherited)
+            elif node.get('type') == 'group':
+                hit = visit(node.get('children'),
+                            inherited or node.get('extra_vertical_scroll') is True)
+                if hit is not None:
+                    return hit
+        return None
+    return visit(tree) is True
+
+
+def set_group_extra_vertical_scroll(tree, group_id, enabled):
+    """Make a persistent and undoable tree copy, retaining all other fields."""
+    result = deepcopy(tree)
+    group = get_group(result, group_id)
+    if group is None:
+        raise ValueError('Page group does not exist.')
+    if enabled:
+        group['extra_vertical_scroll'] = True
+    else:
+        group.pop('extra_vertical_scroll', None)
     return result

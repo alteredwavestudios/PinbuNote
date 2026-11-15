@@ -48,6 +48,20 @@ def normalise_zoom(raw):
     return zoom_value(raw.get('mode'), raw.get('scale'))
 
 
+def extra_vertical_scene_padding(page_height, visible_height):
+    """A bounded, viewport-relative empty margin around page content.
+
+    Large enough that a short slide may be centred with the scroll wheel,
+    without resampling PDFs or changing any annotation/page coordinates.
+    """
+    if not (math.isfinite(page_height) and math.isfinite(visible_height)):
+        return 0.0
+    if page_height <= 0 or visible_height <= 0:
+        return 0.0
+    return max(visible_height * 0.70,
+               (visible_height - page_height) * 0.5 + visible_height * 0.22)
+
+
 def normalise_position(raw):
     if not isinstance(raw, dict):
         return None
@@ -61,8 +75,17 @@ def normalise_position(raw):
     if (not math.isfinite(x) or not math.isfinite(y)
             or not 0 <= x <= 1 or not 0 <= y <= 1):
         return None
-    return {'x': round(x, 7), 'y': round(y, 7),
-            'bottom': raw.get('bottom') is True}
+    clean = {'x': round(x, 7), 'y': round(y, 7),
+             'bottom': raw.get('bottom') is True}
+    # Optional signed scene-relative position for users who deliberately
+    # scroll above or below the page. Older notebook positions remain valid.
+    outside = raw.get('overscroll_y')
+    if type(outside) in (float, int):
+        outside = float(outside)
+        if math.isfinite(outside) and -8.0 <= outside <= 8.0:
+            clean['overscroll_y'] = round(outside, 7)
+            clean['bottom'] = False
+    return clean
 
 
 def root_for_page(tree, page_id):

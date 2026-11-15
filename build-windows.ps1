@@ -1,4 +1,4 @@
-# Yomu Note v0.8.5 - Windows standalone bundle with PRIVATE offline OCR.
+# Pinbu Note v0.8.7c - Windows standalone bundle with PRIVATE offline OCR.
 # Tesseract must be installed on this BUILD computer only, NOT on user PCs.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -30,7 +30,7 @@ if ($LASTEXITCODE -ne 0) {
 $exe = Join-Path $stage 'tesseract.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw 'Staging did not produce tesseract.exe' }
 $pyiArgs = @('--noconfirm', '--clean', '--windowed', '--onedir',
-    '--name', 'Yomu Note', '--icon', 'assets/icon.ico',
+    '--name', 'Pinbu Note', '--icon', 'assets/icon.ico',
     '--add-data', 'assets;assets',
     '--add-data', 'LICENSE;.',
     '--add-data', 'THIRD_PARTY_NOTICES.md;.',
@@ -47,8 +47,8 @@ $pyiArgs += 'main.py'
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 # Restore CPython's SQLite DLL if OCR's copy was chosen, then launch
 # the frozen EXE itself before making an installer.
-& $python scripts\verify_windows_frozen.py --dist (Join-Path $PSScriptRoot 'dist\Yomu Note') --fix-sqlite
+& $python scripts\verify_windows_frozen.py --dist (Join-Path $PSScriptRoot 'dist\Pinbu Note') --fix-sqlite
 if ($LASTEXITCODE -ne 0) { throw 'Frozen app startup check failed; refuse to package' }
-& $python ocr_packaging\verify_ocr_bundle.py --target windows --dist (Join-Path $PSScriptRoot 'dist\Yomu Note')
+& $python ocr_packaging\verify_ocr_bundle.py --target windows --dist (Join-Path $PSScriptRoot 'dist\Pinbu Note')
 if ($LASTEXITCODE -ne 0) { throw 'OCR verification failed. Do not distribute this build.' }
-Write-Host 'Finished! Offline OCR is bundled in dist\Yomu Note\Yomu Note.exe'
+Write-Host 'Finished! Offline OCR is bundled in dist\Pinbu Note\Pinbu Note.exe'

@@ -1,4 +1,4 @@
-"""Start Yomu Note. Compatible with macOS Apple Silicon, Windows and Linux."""
+"""Start Pinbu Note. Compatible with macOS Apple Silicon, Windows and Linux."""
 from __future__ import annotations
 import sys
 from pathlib import Path
@@ -15,7 +15,7 @@ def _verify_frozen_runtime():
     import sqlite3
     import traceback
 
-    marker = Path(sys.argv[sys.argv.index('--yomu-bundle-smoke') + 1])
+    marker = Path(sys.argv[sys.argv.index('--pinbu-bundle-smoke' if '--pinbu-bundle-smoke' in sys.argv else '--yomu-bundle-smoke') + 1])
     try:
         if not getattr(sys, 'frozen', False):
             raise RuntimeError('Bundle check requires the packaged executable')
@@ -38,7 +38,7 @@ def _verify_frozen_runtime():
     return 0
 
 
-if __name__ == '__main__' and '--yomu-bundle-smoke' in sys.argv:
+if __name__ == '__main__' and any(flag in sys.argv for flag in ('--pinbu-bundle-smoke', '--yomu-bundle-smoke')):
     sys.exit(_verify_frozen_runtime())
 
 from PySide6.QtGui import QIcon, QPixmapCache, QFont, QFontDatabase
@@ -64,9 +64,9 @@ def _font_warning_filter(message_type, context, message):
 def main():
     qInstallMessageHandler(_font_warning_filter)
     app = QApplication(sys.argv)
-    app.setApplicationName('Yomu Note')
+    app.setApplicationName('Pinbu Note')
     app.setApplicationVersion(__version__)
-    app.setOrganizationName('Yomu Note')
+    app.setOrganizationName('Pinbu Note')
     app.setStyle('Fusion')
     # Avoid retaining unlimited images in Qt's global implicit pixmap cache.
     # Thumbnail widgets own at most 20 icon pixmaps; inactive tabs release them.
@@ -91,7 +91,15 @@ def main():
     icon = resources / 'assets' / 'icon.png'
     if icon.exists():
         app.setWindowIcon(QIcon(str(icon)))
-    window = MainWindow()
+    # A double-clicked .pinbunote file is passed as a command-line argument.
+    # It must open that file, not silently create a new empty notebook.
+    initial_notebook = None
+    for argument in sys.argv[1:]:
+        candidate = Path(argument).expanduser()
+        if candidate.suffix.lower() in ('.pinbunote', '.yomunote', '.yominote'):
+            initial_notebook = candidate
+            break
+    window = MainWindow(initial_path=initial_notebook)
     window.show()
     return app.exec()
 

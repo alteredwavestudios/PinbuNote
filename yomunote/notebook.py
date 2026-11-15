@@ -30,6 +30,8 @@ from .project import Project, safe_name, unique_project_path, short_id
 from .reading_view import clean_reading_view
 from .snapshot_save import (SaveGuard, FrozenFile, SaveSnapshot,
                             MAX_SNAPSHOT_JSON_BYTES)
+from .notebook_lock import (NotebookLease, NotebookInUseError,
+                            NotebookExternallyModifiedError, disk_signature)
 
 NOTEBOOK_VERSION = 5
 MAGIC_FORMAT = 'yomu-notebook'
@@ -93,14 +95,14 @@ def _safe_relative(value, allowed_ids):
 
 
 def default_backup_folder():
-    """User-writable per-app data, NOT admin-protected Program Files/Common Files."""
+    """User-writable Pinbu Note backups (legacy Yomu backups remain untouched)."""
     import sys
     if sys.platform == 'win32':
         base = os.environ.get('LOCALAPPDATA') or str(Path.home() / 'AppData' / 'Local')
-        return Path(base) / 'Yomu Note' / 'Backups'
+        return Path(base) / 'Pinbu Note' / 'Backups'
     if sys.platform == 'darwin':
-        return Path.home() / 'Library' / 'Application Support' / 'Yomu Note' / 'Backups'
-    return Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local' / 'share'))) / 'Yomu Note' / 'Backups'
+        return Path.home() / 'Library' / 'Application Support' / 'Pinbu Note' / 'Backups'
+    return Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local' / 'share'))) / 'Pinbu Note' / 'Backups'
 
 
 
@@ -203,18 +205,26 @@ class Notebook:
         self._saved_manifest = None
         self.backup_dirty = False
         self._closed = False
+        # Acquire before the workspace is used and before any SQLite write.
+        # Keep the OS handle alive for the whole editable session.
+        self._lease = NotebookLease(self.path).acquire()
         self._save_guard = SaveGuard()
+        self._save_guard.disk_identity = disk_signature(self.path)
 
     @classmethod
     def _new_workspace(cls, path, name, tabs, active_id, identifier):
         temporary = tempfile.TemporaryDirectory(prefix='yomu-notebook-')
-        return cls(path, name, tabs, active_id, identifier, temporary)
+        try:
+            return cls(path, name, tabs, active_id, identifier, temporary)
+        except BaseException:
+            temporary.cleanup()
+            raise
 
     @classmethod
-    def create(cls, parent: Path, name: str):
+    def create(cls, parent: Path, name: str, *, extension='.yomunote'):
         parent = Path(parent).expanduser()
         parent.mkdir(parents=True, exist_ok=True)
-        path = unique_project_path(parent, name)
+        path = unique_project_path(parent, name, extension=extension)
         identifier = uuid.uuid4().hex
         tabid = uuid.uuid4().hex
         tab = {'id': tabid, 'title': 'My Notes'}
@@ -237,9 +247,9 @@ class Notebook:
         if path.is_dir():
             return cls.migrate_legacy(path)
         if not path.is_file():
-            raise ValueError('Choose an existing Yomu Note notebook file.')
-        if path.suffix.lower() not in ('.yomunote', '.yominote'):
-            raise ValueError('Choose a .yomunote notebook (or older .yominote file).')
+            raise ValueError('Choose an existing Pinbu Note or legacy Yomu Note notebook file.')
+        if path.suffix.lower() not in ('.pinbunote', '.yomunote', '.yominote'):
+            raise ValueError('Choose a .pinbunote or legacy .yomunote/.yominote notebook.')
         try:
             with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as conn:
                 # Check the metadata size in SQLite, BEFORE fetching a
@@ -329,13 +339,16 @@ class Notebook:
                             project.save()
                     if recover_cosmetic and nb.recovery_warnings:
                         nb.save()
+                    if disk_signature(path) != nb._save_guard.disk_identity:
+                        raise NotebookExternallyModifiedError(
+                            'Notebook changed externally while its pages were being loaded.')
                     nb.upgrade_legacy_extension()
                     return nb
                 except Exception:
                     nb.close()
                     raise
         except sqlite3.DatabaseError as exc:
-            raise ValueError('This file is not a supported Yomu Note notebook.') from exc
+            raise ValueError('This file is not a supported Pinbu Note notebook.') from exc
 
     @staticmethod
     def _check_manifest(meta):
@@ -699,7 +712,12 @@ class Notebook:
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)
+        new_lease = NotebookLease(destination).acquire()
+        old_lease = self._lease
+        self._lease = new_lease
         self.path = destination
+        self._save_guard.disk_identity = disk_signature(destination)
+        old_lease.release()
         self.backup_dirty = True
         return True
 
@@ -764,6 +782,11 @@ class Notebook:
         """Original incremental SQLite save, retained for explicit operations."""
         if self._closed:
             raise RuntimeError('Notebook has been closed.')
+        if disk_signature(self.path) != self._save_guard.disk_identity:
+            raise NotebookExternallyModifiedError(
+                'This notebook was modified on disk by another application or '
+                'an older Pinbu Note version. Saving has been blocked to prevent '
+                'overwriting changes. Close both copies and restore a known-good backup.')
         self.upgrade_legacy_extension()
         meta = self._manifest()
         self._check_manifest(meta)
@@ -838,6 +861,7 @@ class Notebook:
                     changed = True
                 if changed:
                     conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)', ('manifest', serial))
+        self._save_guard.disk_identity = disk_signature(self.path)
         self._saved_stats = new_stats
         self._saved_manifest_hashes = new_hashes
         self._saved_manifest = serial
@@ -855,7 +879,7 @@ class Notebook:
         self.save()
         prefix = f'{self.identifier}_'
         stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
-        output = directory / f'{prefix}{stamp}.yomunote'
+        output = directory / f'{prefix}{stamp}{self.path.suffix.lower()}'
         temp = output.with_suffix('.tmp')
         try:
             with closing(sqlite3.connect(self.path)) as source, closing(sqlite3.connect(temp)) as destination:
@@ -867,7 +891,7 @@ class Notebook:
         # Also include legacy snapshots prefixed with the old name.
         previous = sorted(
             (p for p in directory.iterdir()
-             if p.suffix.lower() in ('.yomunote', '.yominote')
+             if p.suffix.lower() in ('.pinbunote', '.yomunote', '.yominote')
              and (p.name.startswith(prefix)
                   or f'_{self.identifier}_' in p.name)),
             key=lambda p: p.stat().st_mtime_ns,
@@ -890,7 +914,7 @@ class Notebook:
         with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as conn:
             row = conn.execute('SELECT value FROM meta WHERE key=?', ('manifest',)).fetchone()
             if not row:
-                raise ValueError('Not a Yomu notebook backup.')
+                raise ValueError('Not a supported notebook backup.')
             Notebook._check_manifest(json.loads(row[0]))
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -930,8 +954,8 @@ class Notebook:
         destination = Path(destination).expanduser().resolve()
         if source == destination or destination.exists():
             raise FileExistsError('Choose a NEW file name for the cleaned copy.')
-        if destination.suffix.lower() != '.yomunote':
-            raise ValueError('Cleaned copies must have a .yomunote extension.')
+        if destination.suffix.lower() not in ('.pinbunote', '.yomunote'):
+            raise ValueError('Cleaned copies must have a supported notebook extension.')
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             # A read-only connection gets a consistent snapshot while
@@ -987,7 +1011,7 @@ class Notebook:
         number = 1
         while True:
             suffix = ' Recovered' if number == 1 else f' Recovered {number}'
-            output = source.with_name(source.stem + suffix + '.yomunote')
+            output = source.with_name(source.stem + suffix + source.suffix.lower())
             if not output.exists():
                 break
             number += 1
@@ -1005,5 +1029,8 @@ class Notebook:
             if not self._closed:
                 self._save_guard.closed = True
                 self._save_guard.generation += 1
-                self._temporary.cleanup()
-                self._closed = True
+                try:
+                    self._temporary.cleanup()
+                finally:
+                    self._lease.release()
+                    self._closed = True

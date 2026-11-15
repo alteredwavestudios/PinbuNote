@@ -215,7 +215,7 @@ def test_native_scripts_fail_closed_and_installer_includes_everything():
     root = Path(__file__).resolve().parents[1]
     win = (root / 'build-windows.ps1').read_text()
     mac = (root / 'build-mac.command').read_text()
-    iss = (root / 'YomuNote_v050_Installer.iss').read_text()
+    iss = (root / 'PinbuNote_Installer.iss').read_text()
     assert 'prepare_ocr.py' in win and 'verify_ocr_bundle.py' in win
     assert 'prepare_ocr.py' in mac and 'verify_ocr_bundle.py' in mac
     assert '--add-binary' in win and '--add-binary' in mac

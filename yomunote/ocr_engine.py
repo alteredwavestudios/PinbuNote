@@ -197,7 +197,7 @@ def recognise_regions(project, page: dict, regions, *, dpi: int = 300,
     # A blank page is invalid regardless of whether Tesseract is installed.
     executable = find_tesseract()
     if not executable:
-        raise FileNotFoundError('No OCR engine found. The packaged app should include offline OCR; please reinstall Yomu Note. Source builds require Tesseract on the build computer.')
+        raise FileNotFoundError('No OCR engine found. The packaged app should include offline OCR; please reinstall Pinbu Note. Source builds require Tesseract on the build computer.')
     source = project.asset_path(page['render_source'])
     number = page.get('source_page')
     results = []

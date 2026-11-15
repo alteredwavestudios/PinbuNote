@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import re
+import base64
+from io import BytesIO
 from uuid import uuid4
 
 MAX_STROKE_POINTS = 4096
@@ -15,7 +17,11 @@ MAX_STROKE_WIDTH = 0.10
 MIN_STROKE_WIDTH = 0.0005
 _COLOUR = re.compile(r'#[0-9a-fA-F]{6}\Z')
 SHAPES = frozenset(('line', 'arrow', 'rectangle', 'ellipse'))
-VECTOR_KINDS = frozenset(('stroke', 'shape', 'highlight', 'highlight_line'))
+# A modest inline JPEG budget keeps photo marks portable through tab exchange,
+# with no external file that could become orphaned after Undo. The v0.8.6
+# preview only decodes the CURRENT page's photos.
+MAX_PHOTO_JPEG_BYTES = 320_000
+VECTOR_KINDS = frozenset(('stroke', 'shape', 'highlight', 'highlight_line', 'photo', 'sticky'))
 
 
 def _unit(value):
@@ -197,16 +203,116 @@ def make_highlight_line(first, last, color, width, opacity=35):
     return result
 
 
+def valid_photo(mark: object, *, verify_data: bool = False) -> bool:
+    """Photo is a compressed, self-contained JPEG with page-relative geometry.
+
+    Loading from disk performs a full base64 check. Geometry editing avoids
+    rescanning the JPEG on every mouse movement.
+    """
+    if not isinstance(mark, dict) or mark.get('kind') != 'photo':
+        return False
+    data = mark.get('data')
+    if not (isinstance(mark.get('id'), str) and 1 <= len(mark['id']) <= 96
+            and isinstance(data, str) and 4 <= len(data) <= ((MAX_PHOTO_JPEG_BYTES+2)//3)*4
+            and len(data) % 4 == 0 and data.startswith('/9j/')
+            and all(_unit(mark.get(k)) for k in ('x','y','w','h'))
+            and mark['w'] >= 0.001 and mark['h'] >= 0.001
+            and mark['x'] + mark['w'] <= 1.000001
+            and mark['y'] + mark['h'] <= 1.000001
+            and ('opacity' not in mark or valid_opacity(mark['opacity']))
+            and mark.get('alignment', 'left') in ('left', 'center', 'right')
+            and type(mark.get('show_background', True)) is bool
+            and type(mark.get('letter_spacing_pct', 100)) in (int, float)
+            and math.isfinite(mark.get('letter_spacing_pct', 100))
+            and 80 <= mark.get('letter_spacing_pct', 100) <= 150):
+        return False
+    if verify_data:
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return False
+        if not (4 <= len(decoded) <= MAX_PHOTO_JPEG_BYTES and
+                decoded[:3] == b'\xff\xd8\xff' and decoded[-2:] == b'\xff\xd9'):
+            return False
+        # Read just the JPEG header. Never decompress a malicious 1e9-pixel
+        # photo from a corrupt notebook into a QPixmap on the GUI thread.
+        try:
+            from PIL import Image
+            with Image.open(BytesIO(decoded)) as image:
+                return (image.format == 'JPEG' and image.width > 0 and
+                        image.height > 0 and image.width * image.height <= 4_000_000)
+        except (OSError, ValueError):
+            return False
+    return True
+
+
+def make_photo(jpeg: bytes, rect, opacity=100) -> dict:
+    """Create one undoable, portable photo annotation from bounded JPEG."""
+    if (not isinstance(jpeg, bytes) or
+            not 4 <= len(jpeg) <= MAX_PHOTO_JPEG_BYTES or
+            jpeg[:3] != b'\xff\xd8\xff' or jpeg[-2:] != b'\xff\xd9'):
+        raise ValueError('Photo must be a small valid JPEG image.')
+    x, y, w, h = rect
+    mark = {'kind': 'photo', 'id': uuid4().hex,
+            'x': float(x), 'y': float(y), 'w': float(w), 'h': float(h),
+            'data': base64.b64encode(jpeg).decode('ascii'), 'opacity': opacity}
+    if not valid_photo(mark):
+        raise ValueError('Invalid photo annotation dimensions.')
+    return mark
+
+
+def valid_sticky(mark: object) -> bool:
+    """Plain-text sticky with bounded, page-relative geometry and uniform style."""
+    if not isinstance(mark, dict) or mark.get('kind') != 'sticky':
+        return False
+    text = mark.get('text')
+    font = mark.get('font')
+    return (isinstance(mark.get('id'), str) and 1 <= len(mark['id']) <= 96
+            and isinstance(text, str) and len(text) <= 8000
+            and isinstance(font, str) and 1 <= len(font) <= 100
+            and not any(ord(char) < 32 for char in font)
+            and type(mark.get('font_size')) in (int, float)
+            and math.isfinite(mark['font_size']) and 6 <= mark['font_size'] <= 72
+            and type(mark.get('bold')) is bool and type(mark.get('italic')) is bool
+            and isinstance(mark.get('color'), str) and bool(_COLOUR.fullmatch(mark['color']))
+            and all(_unit(mark.get(k)) for k in ('x','y','w','h'))
+            and mark['w'] >= .025 and mark['h'] >= .025
+            and mark['x'] + mark['w'] <= 1.000001
+            and mark['y'] + mark['h'] <= 1.000001
+            and ('opacity' not in mark or valid_opacity(mark['opacity']))
+            and mark.get('alignment', 'left') in ('left', 'center', 'right')
+            and type(mark.get('show_background', True)) is bool
+            and type(mark.get('letter_spacing_pct', 100)) in (int, float)
+            and math.isfinite(mark.get('letter_spacing_pct', 100))
+            and 80 <= mark.get('letter_spacing_pct', 100) <= 150)
+
+
+def make_sticky(text='', *, rect=(.12, .10, .35, .24), color='#FFE88E',
+                font='Nunito', font_size=16, bold=False, italic=False, opacity=100,
+                alignment='left', show_background=True, letter_spacing_pct=100):
+    x, y, w, h = rect
+    mark = {'kind':'sticky', 'id':uuid4().hex, 'text':str(text),
+            'x':float(x), 'y':float(y), 'w':float(w), 'h':float(h),
+            'color':color, 'font':font, 'font_size':font_size,
+            'bold':bool(bold), 'italic':bool(italic), 'opacity':opacity,
+            'alignment':alignment, 'show_background':bool(show_background),
+            'letter_spacing_pct':letter_spacing_pct}
+    if not valid_sticky(mark):
+        raise ValueError('Invalid sticky note.')
+    return mark
+
+
 def valid_vector(mark: object) -> bool:
     """Dispatch to the correct validator for each supported annotation type."""
-    return valid_stroke(mark) or valid_shape(mark) or valid_highlight(mark)
+    return (valid_stroke(mark) or valid_shape(mark) or valid_highlight(mark)
+            or valid_photo(mark) or valid_sticky(mark))
 
 
 def vector_bounds(mark: dict) -> tuple[float, float, float, float]:
     """Return the geometry bounds excluding pen thickness, all in 0..1."""
     if not valid_vector(mark):
         raise ValueError('Invalid vector annotation')
-    if mark['kind'] == 'highlight':
+    if mark['kind'] in ('highlight', 'photo', 'sticky'):
         return mark['x'], mark['y'], mark['x'] + mark['w'], mark['y'] + mark['h']
     if mark['kind'] in ('shape', 'highlight_line'):
         return (min(mark['x1'], mark['x2']), min(mark['y1'], mark['y2']),
@@ -224,7 +330,7 @@ def translated_vector(mark: dict, dx: float, dy: float) -> dict:
     left, top, right, bottom = vector_bounds(mark)
     dx = min(1.0 - right, max(-left, float(dx)))
     dy = min(1.0 - bottom, max(-top, float(dy)))
-    if mark['kind'] == 'highlight':
+    if mark['kind'] in ('highlight', 'photo', 'sticky'):
         moved = {**mark, 'x': min(1., max(0., mark['x'] + dx)),
                  'y': min(1., max(0., mark['y'] + dy))}
         if mark.get('segments'):
@@ -279,6 +385,30 @@ def resized_vector(mark: dict, handle: str, x: float, y: float, *,
         return {**mark, keys[0]: proposed_x, keys[1]: proposed_y}
     if handle not in ('tl', 'tr', 'bl', 'br'):
         raise ValueError('Invalid resize corner')
+    if mark['kind'] == 'photo':
+        # Photo corners preserve the original shape; Shift is not required.
+        left, top, right, bottom = vector_bounds(mark)
+        ratio = mark['h'] / mark['w']
+        if from_center:
+            cx, cy = (left+right)/2, (top+bottom)/2
+            desired_w = max(.001, 2*abs(x-cx), 2*abs(y-cy)/ratio)
+            width = min(desired_w, 2*min(cx,1-cx), 2*min(cy,1-cy)/ratio)
+            width = max(.001, width)
+            proposed = {**mark, 'x': cx-width/2, 'y': cy-width*ratio/2,
+                        'w': width, 'h': width*ratio}
+        else:
+            anchor_x = right if 'l' in handle else left
+            anchor_y = bottom if 't' in handle else top
+            desired_w = max(.001, abs(x-anchor_x), abs(y-anchor_y)/ratio)
+            max_w = (anchor_x if 'l' in handle else 1-anchor_x)
+            max_h = (anchor_y if 't' in handle else 1-anchor_y)/ratio
+            width = min(desired_w, max_w, max_h)
+            if width < .001:
+                return mark
+            proposed = {**mark, 'x': anchor_x-width if 'l' in handle else anchor_x,
+                        'y': anchor_y-width*ratio if 't' in handle else anchor_y,
+                        'w': width, 'h': width*ratio}
+        return proposed if valid_photo(proposed) else mark
     left, top, right, bottom = vector_bounds(mark)
     if keep_aspect and mark['kind'] == 'shape' and mark.get('shape') in ('rectangle', 'ellipse'):
         orig_w, orig_h = max(1e-6, right-left), max(1e-6, bottom-top)
@@ -307,7 +437,7 @@ def resized_vector(mark: dict, handle: str, x: float, y: float, *,
         x = left if 'l' in handle else right
         y = top if 't' in handle else bottom
         # The rest of resizing should remap the original geometry only once.
-    elif from_center and mark['kind'] in ('shape', 'stroke', 'highlight'):
+    elif from_center and mark['kind'] in ('shape', 'stroke', 'highlight', 'sticky'):
         cx, cy = (left+right)/2, (top+bottom)/2
         wanted_half_w, wanted_half_h = abs(x-cx), abs(y-cy)
         wanted_half_w = min(wanted_half_w, cx, 1-cx)
@@ -336,7 +466,7 @@ def resized_vector(mark: dict, handle: str, x: float, y: float, *,
         return [min(1., max(0., left + u * (right - left))),
                 min(1., max(0., top + v * (bottom - top)))]
 
-    if mark['kind'] == 'highlight':
+    if mark['kind'] in ('highlight', 'sticky'):
         resized = {**mark, 'x': left, 'y': top, 'w': right-left, 'h': bottom-top}
         if mark.get('segments'):
             new_boxes = []
