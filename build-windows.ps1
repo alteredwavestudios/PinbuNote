@@ -1,4 +1,4 @@
-# Yomu Note v0.8.3b - Windows standalone bundle with PRIVATE offline OCR.
+# Yomu Note v0.8.5 - Windows standalone bundle with PRIVATE offline OCR.
 # Tesseract must be installed on this BUILD computer only, NOT on user PCs.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot

@@ -6,7 +6,7 @@ No PDFium handles, QObjects, pixmaps, or source document edits escape the worker
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 
@@ -31,16 +31,42 @@ class TextPageGeometry:
     glyphs: list[Glyph]
     text: str                  # 1 codepoint per PDFium character index
     char_count: int
+    # Immutable after extraction: one shallow row index built on first mouse
+    # hit-test, never persisted and never shared with a PDFium handle.
+    _hit_buckets: tuple[tuple[Glyph, ...], ...] | None = field(
+        default=None, init=False, repr=False, compare=False)
+
+    def _hit_candidates(self, y: float) -> tuple[Glyph, ...]:
+        """Return only glyphs possibly within the original ±.045 y-band.
+
+        Each bucket stores glyphs whose y0..y1 range, expanded by .045,
+        intersects that row. Preserve input order to keep exact tie-breaking.
+        The bucket count and number of pointers are bounded by MAX_CHARS.
+        """
+        rows = self._hit_buckets
+        if rows is None:
+            bins: list[list[Glyph]] = [[] for _ in range(48)]
+            for g in self.glyphs:
+                if not all(math.isfinite(v) for v in
+                           (g.x0, g.x1, g.y0, g.y1)):
+                    continue
+                low = min(47, max(0, int(math.floor((g.y0 - .045) * 48))))
+                high = min(47, max(0, int(math.floor((g.y1 + .045) * 48))))
+                for index in range(low, high + 1):
+                    bins[index].append(g)
+            rows = tuple(tuple(bucket) for bucket in bins)
+            self._hit_buckets = rows
+        index = min(47, max(0, int(math.floor(y * 48))))
+        return rows[index]
 
     def nearest(self, x: float, y: float) -> int | None:
-        """Snap to the nearest visible glyph; use a small vertical search band."""
-        if not self.glyphs or not math.isfinite(x) or not math.isfinite(y):
+        """Snap to the nearest glyph using a disposable vertical row index."""
+        if (not self.glyphs or not math.isfinite(x) or not math.isfinite(y)
+                or y < -.045 or y > 1.045):
             return None
-        # No per-drag PDF calls. An O(N) scan is cheap for normal pages, and
-        # avoids a complicated spatial cache with unbounded memory growth.
         best_idx = None
         best = float('inf')
-        for g in self.glyphs:
+        for g in self._hit_candidates(y):
             cy = (g.y0 + g.y1) * .5
             dy = max(0.0, abs(y - cy) - (g.y1-g.y0) * .5)
             if dy > .045:  # Not on or near the selected line.
@@ -137,7 +163,11 @@ def inspect_page(source: Path, page_number: int) -> TextPageGeometry | None:
                                             min(1., x1), min(1., y1)))
                     if len(glyphs) < 2 or not any(ch.isalnum() for ch in chars):
                         return None
-                    return TextPageGeometry(glyphs, ''.join(chars), count)
+                    geometry = TextPageGeometry(glyphs, ''.join(chars), count)
+                    # Warm the pure-Python index inside the existing worker,
+                    # not during the first mouse-drag event on the GUI thread.
+                    geometry._hit_candidates(.5)
+                    return geometry
                 finally:
                     textpage.close()
             finally:

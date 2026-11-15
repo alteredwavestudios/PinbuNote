@@ -1,39 +1,57 @@
-# GitHub push instructions (v0.8.3b)
+# Upload Yomu Note v0.8.5 using the same safe branch/CI/release process
 
-This is the **complete GitHub-ready source**, not a Git checkout; it intentionally contains no `.git` folder. First extract it, then copy its contents into a **new clone** of the repository to make a feature-branch pull request.
+**Source:** the `Yomu-Note-v0.8.5-Full-Source.zip` prepared from the tested
+0.8.4c candidate. Alternative: the `Yomu-Note-v0.8.5-Overlay-for-v0.8.3b-GitHub.zip`
+contains only changed and added files relative to the published 0.8.3b source.
 
-## Safe Windows PowerShell recipe
-
-The source ZIP should be fully extracted to `H:\dev\Yomu-Note-v0.8.3b`. It is safe to choose a different folder by changing the `$source` variable below.
+1. Extract the **full source** ZIP into a fresh source folder such as
+   `H:\dev\Yomu-Note-v0.8.5`.
+2. Start PowerShell and follow the commands below. Choose an unused Git clone
+   destination so no existing folder is overwritten.
 
 ```powershell
-$source = 'H:\dev\Yomu-Note-v0.8.3b'
-$repo = 'H:\dev\Yomu-Note-v083b-Git'
+$source = 'H:\dev\Yomu-Note-v0.8.5'
+$repo = 'H:\dev\Yomu-Note-v085-Git'
+if (Test-Path $repo) { throw 'Choose another unused Git checkout directory' }
+if (-not (Test-Path "$source\yomunote\__init__.py")) { throw 'Full source folder not found' }
+
 git clone https://github.com/alteredwavestudios/Yomu-Note.git $repo
-if ($LASTEXITCODE -ne 0) { throw 'Clone failed' }
+if ($LASTEXITCODE -ne 0) { throw 'Git clone failed' }
 Set-Location $repo
-git switch -c feature/v0.8.3b-text-lab
-if ($LASTEXITCODE -ne 0) { throw 'Could not create feature branch' }
-Get-ChildItem -LiteralPath $source -Force | Where-Object Name -NE '.git' | Copy-Item -Destination $repo -Recurse -Force
-# Confirm changes BEFORE committing
+git switch -c release/v0.8.5
+if ($LASTEXITCODE -ne 0) { throw 'Creating release branch failed' }
+
+Get-ChildItem -LiteralPath $source -Force |
+    Where-Object { $_.Name -ne '.git' } |
+    Copy-Item -Destination $repo -Recurse -Force
+
+git diff --check
+if ($LASTEXITCODE -ne 0) { throw 'Diff validation failed' }
 git status --short
 git add -A
 git diff --cached --stat
-git commit -m "Integrate Text Lab and page selection updates for v0.8.3b"
-git push -u origin feature/v0.8.3b-text-lab
+git commit -m 'Prepare Yomu Note v0.8.5 reliability and performance release'
+if ($LASTEXITCODE -ne 0) { throw 'Commit failed' }
+git push -u origin release/v0.8.5
+if ($LASTEXITCODE -ne 0) { throw 'Push failed' }
 ```
 
-**Do not push a tag yet.** Open GitHub and create a pull request from `feature/v0.8.3b-text-lab` into `main`; it will trigger the cross-platform source test workflow. Once it passes and you have tested Windows locally, merge the PR. To trigger the Windows and macOS draft release, tag the tested merged commit and push the tag:
+3. Open <https://github.com/alteredwavestudios/Yomu-Note/pulls>, create a
+   PR from `release/v0.8.5` into `main`, and check all CI jobs.
+4. After merging and verifying *main* is current, tag the merged commit:
 
 ```powershell
+Set-Location 'H:\dev\Yomu-Note-v085-Git'
 git switch main
 git pull --ff-only origin main
-git tag v0.8.3b
-git push origin v0.8.3b
+git log -1 --oneline
+git tag -a v0.8.5 -m 'Yomu Note v0.8.5 reliability and performance'
+git push origin v0.8.5
 ```
 
-Pushing the tag runs `.github/workflows/release.yml`, which packages Windows and both macOS architectures and creates a **draft**, not a published release. Review the artifacts, native installer tests, and release notes before publishing.
+5. GitHub Actions builds Windows Setup and both Mac DMGs, verifies OCR and
+   frozen Windows SQLite startup, and creates a **draft**, not a published
+   release. Test the installer, then publish explicitly as a pre-release.
 
-### Remember the past installer regressions
-
-Do not remove `scripts/verify_windows_frozen.py`, the `--fix-sqlite` step, offline OCR verification, the installed-app smoke test, `Start-Process -Wait -PassThru`, or the deliberate absence of a post-install `[Run]` launch in Inno Setup. Keep the stable Inno `AppId`. See `RELEASE_NOTES_v0.8.3b.md`.
+Never tag the feature branch, use `git push --force`, or replace the v0.8.3b
+installation before the 0.8.5 installer has passed native checks.

@@ -1,6 +1,6 @@
 # Install Yomu Note — Windows, Mac or Linux
 
-**Important:** v0.8.2 is the next public-preview release candidate. Until its draft is tested and published, the existing public installer is **v0.8.1b-rc4**. The workflow creates a draft containing the Windows/macOS installers only after all builds succeed. A maintainer must test and publish it before the new binaries appear publicly.
+**Important:** v0.8.3b Text Lab is the current published pre-release. v0.8.5 is a reliability/performance release candidate; its installers have not yet been published. GitHub Actions creates an unpublished draft only after all native builds succeed.
 
 ## Find the Windows or macOS download
 
@@ -12,7 +12,7 @@
 
 **After installation, close the Setup wizard and launch Yomu Note from the Windows Start menu.** The v0.8.2 RC2 installer does not automatically launch the app from Setup; an installer-launched first run could fail even when normal Start menu launching worked.
 
-Download the Windows Setup EXE from the latest *published* release (currently `YomuNote_Setup_v0.8.1b.exe`; the upcoming v0.8.2 build will be `YomuNote_Setup_v0.8.2.exe`). Close an older running Yomu Note, run the installer and launch it from the Start menu. Updates should use the same application ID as previous releases. If SmartScreen warns about an unsigned preview build, only proceed if you trust the repository and have verified the release source. The first installer is not code-signed.
+Download the Windows Setup EXE from the latest *published* release (currently `YomuNote_Setup_v0.8.3b.exe`; the next v0.8.5 build is expected to be `YomuNote_Setup_v0.8.5.exe`). Close an older running Yomu Note, run the installer and launch it from the Start menu. Updates should use the same application ID as previous releases. If SmartScreen warns about an unsigned preview build, only proceed if you trust the repository and have verified the release source. The first installer is not code-signed.
 
 ## macOS (Apple Silicon or Intel)
 
