@@ -1,3 +1,45 @@
+## v0.8.5 — Reliability and performance public-preview candidate
+
+- Promotes the user-tested v0.8.4c feature set without changing the notebook schema.
+- Adds frozen, revision-aware idle autosaves using separate SQLite worker connections; newer manual saves always win. Manual close/save still waits for durable completion.
+- Moves the final Tab Exchange commit off the GUI thread and cleans cache thumbnails safely.
+- Includes v0.8.4a/b original-asset validation, transactional/undoable cross-tab transfers, empty-tab Undo preview refresh, save coalescing and faster indexed PDF text selection.
+- Refreshes shared app version, Inno Setup file version and GitHub Actions release asset names while retaining the installer AppId and frozen SQLite/offline OCR checks.
+- Release installers remain gated on CI and clean-machine testing; the published v0.8.3b release remains available until 0.8.5 is published.
+
+## v0.8.4c — Background autosave, Tab Exchange worker and cache trimming
+
+- Background idle autosave uses immutable metadata snapshots with independent SQLite connections and guards against stale worker saves.
+- Final Tab Exchange staging/commit runs off the GUI thread; rollback and Undo operate after commit confirmation.
+- Inactive Groups thumbnail icons and old disposable JPEG caches are released without removing source documents or annotations.
+- Large snapshots fall back to the synchronous save path; manual Save/close remain synchronous for durability.
+
+## v0.8.4b — Batched persistence, Text Lab speed and preview Undo fix
+
+- Clear the preview when Undo empties an active destination tab; ignore stale
+  in-flight render results via the existing generation token.
+- Save multiple Qt editors to their tab manifests before ONE SQLite commit
+  in close, Tab Exchange, clean export, and cross-tab transfer paths. If a
+  commit fails, restore each saved pane's dirty flag for retry.
+- Add a bounded per-page vertical index for text hit-testing, precomputed
+  in the background PDF worker, without changing selection/highlight geometry.
+- No notebook schema change. v0.8.4a integrity fixes remain in force.
+- Native Windows/macOS GUI and installer acceptance still required.
+
+## v0.8.4a — Integrity and cross-tab reliability candidate
+
+- Live page asset references are checked on save and load. Missing originals or
+  converted render PDFs cannot silently disappear from the portable notebook.
+- Copy/move across tabs stages files, rolls back both manifests and assets after
+  injected copy/manifest/SQLite failures, and commits once to the notebook DB.
+- Cross-tab page transfers now have a shared, one-step Undo/Redo that preserves
+  unrelated rich text, source annotations, completion status and reading state.
+- Manifest-only timestamp changes no longer trigger redundant SQLite BLOB writes.
+- Source tests include disk-write fault injection, DB rollback, missing-asset,
+  duplicate-source, legacy corruption and Undo/Redo coverage.
+- This is a **development source candidate**, not yet a Windows/macOS installer.
+  The project and notebook storage schema versions remain v4/v5.
+
 ## v0.8.1b — Public-preview test and release hardening
 
 - Fixed annotation identity tracking for Undo/Redo and autosave.

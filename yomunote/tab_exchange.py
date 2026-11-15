@@ -304,56 +304,58 @@ def stage_import(source: Path, tab_ids: list[str], workspace: Path,
 
 
 def commit_import(notebook: Notebook, stage: Path, entries: list[dict]):
-    """All-or-nothing filesystem+SQLite commit; call on owning UI thread.
+    """All-or-nothing filesystem+SQLite commit, safe on a worker thread.
 
-    SQLite writes are transactional. If they fail, restore the original tab
-    manifest and remove staged tab folders so a retry is safe.
+    The caller must keep the receiving window modal until completion. Its
+    Notebook guard serialises the whole file move + SQLite commit against
+    background autosaves, while Qt widgets stay on the GUI thread.
     """
-    if notebook._closed:
-        raise RuntimeError('Destination notebook has been closed.')
-    if not entries or len(entries) + len(notebook.tabs) > MAX_TABS:
-        raise ValueError('Cannot import: destination tab limit would be exceeded.')
-    if any(t['id'] in {x['id'] for x in notebook.tabs} for t in entries):
-        raise ValueError('Imported tab identity collision.')
-    before_tabs = [dict(t) for t in notebook.tabs]
-    before_active = notebook.active_id
-    moved = []
-    try:
-        # A duplicated tab name may have appeared while staging was running;
-        # rename the staged project before the commit rather than overwriting.
-        used = {t['title'] for t in notebook.tabs}
-        for entry in entries:
-            title = _independent_title(entry['title'], used)
-            if title != entry['title']:
-                source_dir = Path(stage) / 'tabs' / entry['id']
-                p = Project.load(source_dir)
-                p.name = title
-                p.save(prune_orphan_annotations=True)
-                entry['title'] = title
-            src = Path(stage) / 'tabs' / entry['id']
-            dest = notebook.workspace / 'tabs' / entry['id']
-            if dest.exists() or not src.is_dir():
-                raise ValueError('Staged tab is missing or already exists.')
-            src.rename(dest)  # same workspace volume; no re-copy of PDFs
-            moved.append(dest)
-        notebook.tabs.extend(dict(e) for e in entries)
-        notebook.active_id = entries[-1]['id']
-        notebook.save()
-    except Exception:
-        notebook.tabs = before_tabs
-        notebook.active_id = before_active
-        # The database transaction has already rolled back if a save failed.
-        for dest in reversed(moved):
-            try:
-                dest.rename(Path(stage) / 'tabs' / dest.name)
-            except OSError:
-                # If a file is locked on Windows, leave it OUTSIDE the live
-                # manifest; the caller can inspect or retry cleanup.
-                pass
-        raise
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
-    return [dict(e) for e in entries]
+    with notebook._save_guard.lock:
+        if notebook._closed:
+            raise RuntimeError('Destination notebook has been closed.')
+        if not entries or len(entries) + len(notebook.tabs) > MAX_TABS:
+            raise ValueError('Cannot import: destination tab limit would be exceeded.')
+        if any(t['id'] in {x['id'] for x in notebook.tabs} for t in entries):
+            raise ValueError('Imported tab identity collision.')
+        before_tabs = [dict(t) for t in notebook.tabs]
+        before_active = notebook.active_id
+        moved = []
+        try:
+            # A duplicated tab name may have appeared while staging was running;
+            # rename the staged project before the commit rather than overwriting.
+            used = {t['title'] for t in notebook.tabs}
+            for entry in entries:
+                title = _independent_title(entry['title'], used)
+                if title != entry['title']:
+                    source_dir = Path(stage) / 'tabs' / entry['id']
+                    p = Project.load(source_dir)
+                    p.name = title
+                    p.save(prune_orphan_annotations=True)
+                    entry['title'] = title
+                src = Path(stage) / 'tabs' / entry['id']
+                dest = notebook.workspace / 'tabs' / entry['id']
+                if dest.exists() or not src.is_dir():
+                    raise ValueError('Staged tab is missing or already exists.')
+                src.rename(dest)  # same workspace volume; no re-copy of PDFs
+                moved.append(dest)
+            notebook.tabs.extend(dict(e) for e in entries)
+            notebook.active_id = entries[-1]['id']
+            notebook.save()
+        except Exception:
+            notebook.tabs = before_tabs
+            notebook.active_id = before_active
+            # The database transaction has already rolled back if a save failed.
+            for dest in reversed(moved):
+                try:
+                    dest.rename(Path(stage) / 'tabs' / dest.name)
+                except OSError:
+                    # If a file is locked on Windows, leave it OUTSIDE the live
+                    # manifest; the caller can inspect or retry cleanup.
+                    pass
+            raise
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        return [dict(e) for e in entries]
 
 
 def set_batch_present(notebook: Notebook, entries: list[dict], present: bool,

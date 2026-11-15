@@ -1,0 +1,18 @@
+Yomu Note v0.8.5 — GitHub-ready release candidate
+Prepared from the complete v0.8.4c development build, which was confirmed working by the user.
+Version: 0.8.5, Windows numeric FileVersion: 0.8.5.0
+Notebook format: v5, unchanged; Inno Setup AppId unchanged.
+Release workflow: pushes of v* tags create draft pre-releases only.
+
+Source Python tests (headless): 505 passed, 49 skipped, 3 subtests passed.
+Native Windows/macOS installer builds and clean-machine testing NOT performed in this environment.
+
+Full files: 318 (unchanged relative to v0.8.3b: 281, changed: 22, added: 15, removed: 0)
+Overlay files: 37
+
+Important testing and publishing rules:
+- Test from an isolated folder and a copy of a notebook.
+- Create a feature branch and PR; do not tag until CI passes and PR merged.
+- Verify Windows SQLite DLL + offline OCR packaging; install and launch from Start menu.
+- Check both Mac builds and unsigned/notarisation limits.
+- Only publish the GitHub draft release after testing actual installers.
