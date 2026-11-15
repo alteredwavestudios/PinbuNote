@@ -428,6 +428,56 @@ def lossless_preview_comparison(project: Project, page: dict, compressed_path: P
             result.close()
 
 
+def trim_disposable_caches(project: Project) -> dict[str, int]:
+    """Bound EXISTING on-disk JPEG caches once per activation, off the UI thread.
+
+    Previously the budgets were applied only after newly rendered images. A
+    notebook reopened with hundreds of older cached files could retain them
+    indefinitely. Never touch originals/pages, JSON, or any symlink. Keep
+    the selected page's normal and thumbnail caches when possible.
+    """
+    limits = (
+        ('thumbs', THUMB_DISK_BUDGET, 4000),
+        ('previews', PREVIEW_DISK_BUDGET, 160),
+        ('previews-adaptive', ADAPTIVE_PREVIEW_DISK_BUDGET, ADAPTIVE_PREVIEW_FILE_LIMIT),
+        ('thumbs-responsive', LARGE_THUMB_DISK_BUDGET, LARGE_THUMB_FILE_LIMIT),
+    )
+    removed = {}
+    with _RENDER_LOCK:
+        for name, budget, max_files in limits:
+            folder = project.path / 'cache' / name
+            if folder.is_symlink() or not folder.is_dir():
+                continue
+            # The cache is disposable; avoid scanning untrusted nested paths.
+            try:
+                files = sorted((p for p in folder.glob('*.jpg')
+                                if p.is_file() and not p.is_symlink()),
+                               key=lambda p: p.stat().st_mtime_ns, reverse=True)
+                size = 0
+                count = 0
+                evicted = 0
+                selected = str(project.selected_page or '')
+                protected = next((p for p in files
+                                  if selected and p.stem.split('_', 1)[0] == selected), None)
+                if protected is not None:
+                    files.remove(protected)
+                    files.insert(0, protected)
+                for path in files:
+                    length = path.stat().st_size
+                    if (count >= max_files or
+                            (count and size + length > budget)):
+                        path.unlink(missing_ok=True)
+                        evicted += 1
+                    else:
+                        count += 1
+                        size += length
+                removed[name] = evicted
+            except OSError:
+                # Caches can be concurrently retired; never block reading.
+                continue
+    return removed
+
+
 def clear_obsolete_preview_tiers(project: Project) -> None:
     """One-time cleanup of 0.3.4c's obsolete, *derived only* raster tiers.
 

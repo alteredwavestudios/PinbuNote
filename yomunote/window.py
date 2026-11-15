@@ -37,7 +37,8 @@ from .notes_layout_dialog import NotesPageSetupDialog
 from .platform_shortcuts import IS_MAC, PRIMARY, ALT, SHIFT, docs_shortcut
 from .ui import FlowLayout, WrapBar, YomuWordmark, SaveToast, SoftButtonMotion, ColourDotButton, line_icon, FocusTimer, FocusFlower, ConfettiOverlay, ReadingProgressBar, KawaiiNotice
 from .importers import (ALL_EXTS, blank_page, import_document, image_for_page,
-                        clear_obsolete_preview_tiers, LARGE_THUMB_MAX_WIDTH)
+                        clear_obsolete_preview_tiers, trim_disposable_caches,
+                        LARGE_THUMB_MAX_WIDTH)
 from .project import Project, PANEL_KEYS, valid_panel_order, short_id, validated_note_pages
 from .reading_view import (empty_view, effective_zoom, remember_zoom,
                            normalise_zoom, fit_zoom, root_for_page,
@@ -4215,6 +4216,20 @@ class ProjectPane(QWidget):
         # Read only IDs/names for the group tree; no extra page pixmaps.
         if hasattr(self, 'group_tree'):
             self._refresh_group_tree()
+        # QListWidget.clear() emits its selection change while _loading is
+        # true, so select_item() intentionally ignores it. If Undo moved the
+        # *last* page away, no later selection signal arrives to clear the
+        # old preview. Explicitly invalidate its render token and artwork.
+        # This is equally important for pending asynchronous page renders.
+        if self.current_page() is None:
+            self.project.selected_page = None
+            self.page_title.setText('PAGE PREVIEW')
+            self.page_title._has_page = False
+            self.page_position.setText('No page selected')
+            if hasattr(self, 'group_tree'):
+                self.group_tree.mark_active(None)
+            if self._active:
+                self.display_current()
         # Page count may have changed in the traditional thumbnail view.
         self.readingChanged.emit()
         self.schedule_thumbnails()
@@ -4762,7 +4777,10 @@ class ProjectPane(QWidget):
         # the live page, original documents, notes or normal caches.
         if not getattr(self, '_old_tiers_cleanup_started', False):
             self._old_tiers_cleanup_started = True
-            start_task(self, lambda: clear_obsolete_preview_tiers(self.project),
+            def prune_disposable_cache():
+                clear_obsolete_preview_tiers(self.project)
+                return trim_disposable_caches(self.project)
+            start_task(self, prune_disposable_cache,
                        lambda *_: None, priority=-3)
         self._thumbnail_bucket = self._thumbnail_width_for_view()
         self.schedule_thumbnails()
@@ -4792,6 +4810,11 @@ class ProjectPane(QWidget):
         self._loaded_thumb_rows.clear()
         self._thumb_pending.clear()
         self._wanted_thumbnail_ids = frozenset()
+        # Group thumbnails live in separate QTreeWidget icons. Release them
+        # too, or dozens of inactive tabs retain invisible pixmaps in RAM.
+        self.group_tree.discard_other_thumbnails(set())
+        self._group_thumb_pending.clear()
+        self._wanted_group_thumb_ids = frozenset()
         self.canvas.show_image(None)
         self._sync_text_select_availability()
         self._view_restoring = False
@@ -7322,13 +7345,15 @@ class ProjectPane(QWidget):
     def _autosave(self):
         if not self._dirty or self._closed:
             return
+        self._saving_from_autosave = True
         try:
             self.save()
         except Exception as exc:
-            # Keep dirty state, let the user continue, and retry without
-            # emitting repetitive modal error dialogs while typing.
+            # Keep dirty state and retry without repetitive modal dialogs.
             self.statusMessage.emit(f'Autosave could not finish: {exc}')
-            self._save_timer.start()  # retry next minute, not every 5 seconds
+            self._save_timer.start()  # retry next minute
+        finally:
+            self._saving_from_autosave = False
 
     def save(self):
         self._capture_displayed_reading_position()
@@ -7586,6 +7611,9 @@ class MainWindow(QMainWindow):
             self.theme = 'washi'
         self.notebook = None
         self._exchange_busy = False
+        self._background_save_ticket = None
+        self._background_save_pending_panes = set()
+        self._exchange_deferred_panes = set()
         self._exchange_cancel = None
         self._exchange_progress = None
         self.setAcceptDrops(True)
@@ -8070,6 +8098,120 @@ class MainWindow(QMainWindow):
         widget = self.tabs.currentWidget()
         return widget if isinstance(widget, ProjectPane) else None
 
+    def _on_pane_container_save(self, pane):
+        """Only idle autosaves use the worker; structural edits stay atomic."""
+        notebook = self.notebook
+        if (not notebook or getattr(self, '_batching_pane_saves', False)
+                or not pane.project.path.is_relative_to(notebook.workspace)):
+            return
+        if self._exchange_busy:
+            # The tab-exchange worker alone owns SQLite while its modal dialog
+            # is visible. Preserve a new autosave for a post-exchange commit.
+            self._exchange_deferred_panes.add(pane)
+            return
+        if (getattr(pane, '_saving_from_autosave', False)
+                and not self._changing_notebook):
+            self._queue_background_notebook_save((pane,))
+        else:
+            notebook.save()
+
+    def _queue_background_notebook_save(self, panes):
+        """Coalesce idle saves and never pass a Qt widget to the worker."""
+        notebook = self.notebook
+        if notebook is None or notebook._closed:
+            return
+        active = getattr(self, '_background_save_ticket', None)
+        if active is not None:
+            if active['notebook'] is notebook:
+                self._background_save_pending_panes.update(panes)
+                return
+            # Another notebook is retiring; the old worker's guarded snapshot
+            # will be skipped if that notebook has already closed.
+            self._background_save_pending_panes.clear()
+        try:
+            snapshot = notebook.capture_save_snapshot()
+        except Exception as exc:
+            from .snapshot_save import SnapshotTooLarge
+            if not isinstance(exc, SnapshotTooLarge):
+                raise
+            # Never allocate hundreds of MB merely to save in the background.
+            # Rare oversized notebooks still use the proven synchronous path.
+            notebook.save()
+            return
+        ticket = {'notebook': notebook, 'panes': tuple(panes)}
+        self._background_save_ticket = ticket
+        self.statusBar().showMessage('Saving notebook in the background…', 1600)
+
+        def worker():
+            # Never share Qt widgets, QTextDocuments or SQLite connections.
+            from .snapshot_save import write_snapshot
+            return write_snapshot(snapshot)
+
+        def finished(result, error):
+            if self._background_save_ticket is not ticket:
+                return
+            self._background_save_ticket = None
+            pending = tuple(self._background_save_pending_panes)
+            self._background_save_pending_panes.clear()
+            if notebook is not self.notebook or notebook._closed:
+                return
+            if error:
+                for pane in set(ticket['panes']) | set(pending):
+                    if not pane._closed:
+                        pane.schedule_save()
+                self.statusBar().showMessage(
+                    f'Background autosave failed; will retry: {error}', 6000)
+                return
+            if notebook.accept_background_save(result) and result.changed:
+                self.statusBar().showMessage('Notebook autosaved ♡', 1600)
+            if pending:
+                # Other panes finished their JSON snapshots during this write.
+                # Their edits must get their own *later* SQLite commit.
+                QTimer.singleShot(0, lambda p=pending:
+                    self._queue_background_notebook_save(p)
+                    if notebook is self.notebook and not notebook._closed else None)
+
+        try:
+            start_task(self, worker, finished, priority=-1)
+        except Exception:
+            self._background_save_ticket = None
+            self._background_save_pending_panes.clear()
+            raise
+
+    def _save_panes_in_one_commit(self, panes):
+        """Save each editor's tab manifest, then commit SQLite exactly once.
+
+        Qt editors and their QTextDocuments stay on the GUI thread.  Only the
+        container-save callback is temporarily deferred; the in-memory editor
+        and per-tab project JSON still serialise normally. On failure, re-mark
+        completed panes dirty so the next autosave can retry the durable save.
+        This is deliberately NOT an asynchronous operation or nested batch.
+        """
+        notebook = self.notebook
+        if notebook is None:
+            return False
+        if getattr(self, '_batching_pane_saves', False):
+            raise RuntimeError('Nested notebook save batches are not supported.')
+        saved = []
+        try:
+            self._batching_pane_saves = True
+            for pane in panes:
+                if pane is None or pane._closed:
+                    continue
+                pane.save()
+                saved.append(pane)
+            self._batching_pane_saves = False
+            return notebook.save()
+        except Exception:
+            # pane.save() clears _dirty only after its manifest succeeds; the
+            # enclosing SQLite transaction may still fail. A retry must not
+            # silently omit those editors' recent changes.
+            for pane in saved:
+                pane.schedule_save()
+            raise
+        finally:
+            self._batching_pane_saves = False
+
     def _save_current_tab(self):
         pane = self.active()
         if pane:
@@ -8205,9 +8347,7 @@ class MainWindow(QMainWindow):
         pane.group_tree.tab_id = tab['id']
         pane.group_tree.notebook_id = self.notebook.identifier
         pane.pages_list.pagesPasted.connect(self._transfer_tab_pages)
-        pane.on_container_save = lambda p=pane: (
-            self.notebook.save() if self.notebook and p.project.path.is_relative_to(self.notebook.workspace)
-            else None)
+        pane.on_container_save = lambda p=pane: self._on_pane_container_save(p)
         pane.statusMessage.connect(self.statusBar().showMessage)
         pane.notebookDropped.connect(self.import_notebook_tabs)
         pane.readingChanged.connect(self._update_notebook_progress)
@@ -8266,8 +8406,11 @@ class MainWindow(QMainWindow):
                     pane = self.tabs.widget(i)
                     if pane._importing:
                         raise RuntimeError('Finish importing before switching projects.')
-                    pane.close_project()
-                self.notebook.save()
+                self._save_panes_in_one_commit(
+                    self.tabs.widget(i) for i in range(self.tabs.count()))
+                for i in range(self.tabs.count()):
+                    self.tabs.widget(i).deactivate()
+                    self.tabs.widget(i)._closed = True
                 old = self.notebook
                 old_panes = ([self.tabs.widget(i) for i in range(self.tabs.count())]
                              + list(self._parked_panes.values()))
@@ -8441,12 +8584,31 @@ class MainWindow(QMainWindow):
             self._theme_one_pane(self.tabs.widget(i))
         self._update_undo_actions()
 
-    def _transfer_tab_pages(self, source_id, target_id, page_ids, copy_pages):
-        """Drop onto another tab or paste pages with Ctrl/Command+V.
+    def _refresh_transferred_tabs(self, tab_ids):
+        """Refresh the two navigators without reloading rich-text editors."""
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if pane._tab_id in tab_ids:
+                pane.project = self.notebook.project(pane._tab_id)
+                pane.load_pages()
+                if pane._active:
+                    pane.schedule_thumbnails()
+        self._update_notebook_progress()
+        self._update_undo_actions()
 
-        Ctrl/Option-drag copies; plain drag moves. Rebuild visible lists using
-        the existing page source files; never clone PDF render caches.
-        """
+    def _replay_tab_page_transfer(self, change, *, undo):
+        """A single shared Undo/Redo for both tab manifests and the SQLite file."""
+        if not self.notebook or change.notebook_id != self.notebook.identifier:
+            raise ValueError('This page transfer belongs to a closed notebook.')
+        # Flush outstanding Qt edits once before replacing tab page models.
+        self._save_panes_in_one_commit(
+            self.tabs.widget(i) for i in range(self.tabs.count())
+            if self.tabs.widget(i)._tab_id in (change.source_id, change.target_id))
+        self.notebook.replay_page_transfer(change, undo=undo)
+        self._refresh_transferred_tabs({change.source_id, change.target_id})
+
+    def _transfer_tab_pages(self, source_id, target_id, page_ids, copy_pages):
+        """Move/copy pages as one durable, notebook-wide undoable change."""
         if not self.notebook or source_id == target_id:
             return
         if any(self.tabs.widget(i)._importing for i in range(self.tabs.count())):
@@ -8455,21 +8617,26 @@ class MainWindow(QMainWindow):
         if source_id not in {t['id'] for t in self.notebook.tabs} or target_id not in {t['id'] for t in self.notebook.tabs}:
             return
         try:
-            self._save_current_tab()
-            count = self.notebook.transfer_pages(source_id, target_id, page_ids,
-                                                 move=not copy_pages)
+            # Inactive tabs can have unsaved QTextDocument changes. Flush
+            # both affected tab manifests with one SQLite commit, not two.
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count())
+                if self.tabs.widget(i)._tab_id in (source_id, target_id))
+            count, change = self.notebook.transfer_pages(
+                source_id, target_id, page_ids, move=not copy_pages,
+                return_change=True)
             if not count:
                 return
-            for i in range(self.tabs.count()):
-                pane = self.tabs.widget(i)
-                if pane._tab_id in (source_id, target_id):
-                    pane.project = self.notebook.project(pane._tab_id)
-                    pane.load_pages()
-                    if pane._active:
-                        pane.schedule_thumbnails()
-            self.notebook.save()
-            self._update_notebook_progress()
-            self.statusBar().showMessage(f'{count} page(s) {"copied" if copy_pages else "moved"} between tabs.', 4000)
+            self._refresh_transferred_tabs({source_id, target_id})
+            self._notebook_history.record_applied(CallbackAction(
+                'Copy Pages Between Tabs' if copy_pages else 'Move Pages Between Tabs',
+                lambda c=change: self._replay_tab_page_transfer(c, undo=True),
+                lambda c=change: self._replay_tab_page_transfer(c, undo=False),
+                change.estimated_bytes,
+            ))
+            self.statusBar().showMessage(
+                f'{count} page(s) {"copied" if copy_pages else "moved"} between tabs.',
+                4000)
         except Exception as exc:
             QMessageBox.warning(self, 'Page transfer failed', str(exc))
 
@@ -8690,8 +8857,7 @@ class MainWindow(QMainWindow):
         if pane and self.notebook:
             try:
                 changed = bool(pane._celebrate_on_next_manual_save)
-                pane.save()
-                self.notebook.save()
+                self._save_panes_in_one_commit((pane,))
                 self.settings.setValue('lastSaveDir', str(self.notebook.path.parent))
                 if changed:
                     pane._celebrate_on_next_manual_save = False
@@ -8728,10 +8894,10 @@ class MainWindow(QMainWindow):
         if not destination:
             return
         try:
-            # Save all open tabs first so the copy includes recent work.
-            for index in range(self.tabs.count()):
-                self.tabs.widget(index).save()
-            self.notebook.save()
+            # Save all open editors first; publish one consistent SQLite
+            # snapshot, rather than repeatedly committing while walking tabs.
+            self._save_panes_in_one_commit(
+                self.tabs.widget(index) for index in range(self.tabs.count()))
         except Exception as exc:
             QMessageBox.critical(self, 'Could not prepare clean copy', str(exc))
             return
@@ -8784,14 +8950,25 @@ class MainWindow(QMainWindow):
         if progress is not None:
             progress.close()
             progress.deleteLater()
+        deferred = tuple(self._exchange_deferred_panes)
+        self._exchange_deferred_panes.clear()
+        if deferred and self.notebook:
+            try:
+                self._save_panes_in_one_commit(
+                    p for p in deferred if not p._closed)
+            except Exception as exc:
+                for pane in deferred:
+                    if not pane._closed:
+                        pane.schedule_save()
+                self.statusBar().showMessage(
+                    f'Deferred tab save needs retry: {exc}', 6000)
 
     def _save_tabs_for_exchange(self):
         if any(self.tabs.widget(i)._importing for i in range(self.tabs.count())):
             raise RuntimeError('Finish importing documents before exchanging tabs.')
-        # This covers dirty INACTIVE editor panes too, not just the current one.
-        for i in range(self.tabs.count()):
-            self.tabs.widget(i).save()
-        self.notebook.save()
+        # This covers dirty INACTIVE editors too, with one SQLite commit.
+        self._save_panes_in_one_commit(
+            self.tabs.widget(i) for i in range(self.tabs.count()))
 
     def import_notebook_tabs(self, source_path=None):
         """Inspect a share, let the user select tabs, then import atomically."""
@@ -8830,59 +9007,80 @@ class MainWindow(QMainWindow):
             return stage_import(path, ids, destination_nb.workspace,
                                 used_titles, cancel)
 
-        def finished(result, error):
+        def finish_import(imported, error, index):
+            """All UI/history work happens AFTER the worker's SQLite commit."""
             try:
                 if error:
-                    if not cancel.is_set():
-                        QTimer.singleShot(0, lambda msg=str(error):
-                            QMessageBox.warning(self, 'Tab import failed', msg))
-                    return
-                stage, entries = result
-                if cancel.is_set():
-                    shutil.rmtree(stage, ignore_errors=True)
+                    QMessageBox.warning(self, 'Could not finish tab import', str(error))
                     return
                 if destination_nb is not self.notebook:
-                    shutil.rmtree(stage, ignore_errors=True)
                     return
+                # One undoable history command for the entire imported batch.
+                def hide_batch():
+                    ids_to_hide = {t['id'] for t in imported}
+                    for i in range(self.tabs.count()):
+                        pane = self.tabs.widget(i)
+                        if pane._tab_id in ids_to_hide:
+                            pane.save()
+                    set_batch_present(destination_nb, imported, False)
+                    self._resync_notebook_tabs()
+
+                def show_batch():
+                    set_batch_present(destination_nb, imported, True, index)
+                    self._resync_notebook_tabs()
+
                 try:
-                    index = len(destination_nb.tabs)
-                    imported = commit_import(destination_nb, stage, entries)
-                    # Create one notebook-level history entry only AFTER the
-                    # entire batch is durable. Persist edits before Undo.
-                    def hide_batch():
-                        ids_to_hide = {t['id'] for t in imported}
-                        for i in range(self.tabs.count()):
-                            pane = self.tabs.widget(i)
-                            if pane._tab_id in ids_to_hide:
-                                pane.save()
-                        set_batch_present(destination_nb, imported, False)
-                        self._resync_notebook_tabs()
-
-                    def show_batch():
-                        set_batch_present(destination_nb, imported, True, index)
-                        self._resync_notebook_tabs()
-
-                    # Attach widgets successfully BEFORE registering Undo. A
-                    # Qt construction error must not leave an un-undoable
-                    # partial batch in the receiving notebook.
-                    try:
-                        self._resync_notebook_tabs()
-                        self._notebook_history.record_applied(CallbackAction(
-                            f'Import {len(imported)} Tab(s)', hide_batch,
-                            show_batch, 512 + 160 * len(imported)))
-                    except Exception:
-                        set_batch_present(destination_nb, imported, False)
-                        self._resync_notebook_tabs()
-                        raise
-                    self.statusBar().showMessage(
-                        f'{len(imported)} shared tab(s) imported · one Undo removes all ♡', 6000)
-                except Exception as exc:
-                    QTimer.singleShot(0, lambda msg=str(exc):
-                        QMessageBox.warning(self, 'Could not finish tab import', msg))
+                    self._resync_notebook_tabs()
+                    self._notebook_history.record_applied(CallbackAction(
+                        f'Import {len(imported)} Tab(s)', hide_batch,
+                        show_batch, 512 + 160 * len(imported)))
+                except Exception:
+                    set_batch_present(destination_nb, imported, False)
+                    self._resync_notebook_tabs()
+                    raise
+                self.statusBar().showMessage(
+                    f'{len(imported)} shared tab(s) imported · one Undo removes all ♡', 6000)
+            except Exception as exc:
+                QMessageBox.warning(self, 'Could not finish tab import', str(exc))
             finally:
                 self._end_exchange()
 
-        start_task(self, worker, finished, priority=1)
+        def staged(result, error):
+            if error:
+                try:
+                    if not cancel.is_set():
+                        QMessageBox.warning(self, 'Tab import failed', str(error))
+                finally:
+                    self._end_exchange()
+                return
+            stage, entries = result
+            if cancel.is_set() or destination_nb is not self.notebook:
+                shutil.rmtree(stage, ignore_errors=True)
+                self._end_exchange()
+                return
+            # Finishing an import performs large SQLite BLOB writes. Do NOT
+            # perform this second phase on the Qt GUI thread. The progress
+            # dialog remains modal, preventing edits to tab UI during commit.
+            index = len(destination_nb.tabs)
+            if self._exchange_progress is not None:
+                self._exchange_progress.setLabelText(
+                    'Finalising imported tabs and saving the notebook…')
+                # Commit is atomic but not cancellable once it begins.
+                self._exchange_progress.setCancelButtonText('')
+
+            def commit_worker():
+                return commit_import(destination_nb, stage, entries)
+
+            try:
+                start_task(self, commit_worker,
+                           lambda imported, err: finish_import(imported, err, index),
+                           priority=1)
+            except Exception:
+                shutil.rmtree(stage, ignore_errors=True)
+                self._end_exchange()
+                raise
+
+        start_task(self, worker, staged, priority=1)
 
     def export_selected_tabs(self, default_id=None):
         """Write a clean standalone .yomunote with ONLY selected live tabs."""
@@ -9007,19 +9205,15 @@ class MainWindow(QMainWindow):
             if any(self.tabs.widget(i)._importing for i in range(self.tabs.count())):
                 QMessageBox.information(self, 'Import active', 'Finish importing before closing the project.')
                 return
-            self._save_current_tab()
-            self.notebook.save()
+            # Preserve programmatic edits on inactive panes as well as the
+            # active editor; one complete SQLite commit before retiring them.
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count()))
             self._changing_notebook = True
             try:
                 old = self.notebook
                 visible = [self.tabs.widget(i) for i in range(self.tabs.count())]
                 old_panes = visible + list(self._parked_panes.values())
-                for pane in visible:
-                    # Inactive panes are ordinarily saved on tab switch, but
-                    # close must also cover programmatic edits to hidden tabs.
-                    # Deleted/parked tabs are not included in the saved file.
-                    if pane._dirty and not pane._closed:
-                        pane.save()
                 self.tabs.clear()
                 self._retire_notebook(old, old_panes)
                 self.notebook = None
@@ -9039,13 +9233,14 @@ class MainWindow(QMainWindow):
 
     def _periodic_backup(self):
         """Every 10 min, snapshot only if changed since the previous backup."""
-        if not self.notebook:
-            return
+        if not self.notebook or self._exchange_busy:
+            return  # The exchange owns the notebook manifest until it finishes.
         try:
             pane = self.active()
             if pane and pane._dirty:
-                pane.save()
-            self.notebook.save()
+                self._save_panes_in_one_commit((pane,))
+            else:
+                self.notebook.save()
             if self.notebook.backup_dirty:
                 directory = Path(str(self.settings.value('backupDirectory', default_backup_folder())))
                 limit = int(self.settings.value('backupCount', 30))
@@ -9361,10 +9556,9 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         try:
-            for i in range(self.tabs.count()):
-                self.tabs.widget(i).save()
             if self.notebook:
-                self.notebook.save()
+                self._save_panes_in_one_commit(
+                    self.tabs.widget(i) for i in range(self.tabs.count()))
             self.save_open_tabs()
             event.accept()
         except Exception as exc:

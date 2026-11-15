@@ -1,7 +1,9 @@
-# Yomu Note Text Lab — v0.8.3a experimental 🌸
+# Text Lab: Historical v0.8.3a development notes 🌸
 
-This is a **separate development experiment**, built from public `v0.8.2-rc2`.
-It is **not an official release** and is not intended for ordinary users.
+**Historical document:** Text Lab was integrated and publicly released in
+v0.8.3b. The v0.8.4c reliability candidate retains those features. The
+original prototype limitations and build directions below describe the old
+isolated experiment, not the current public v0.8.3b installer.
 
 ## What works in the prototype
 
@@ -45,3 +47,10 @@ The Windows build expects Python, Inno Setup and the normal Yomu Note OCR packag
 4. Use the Highlight dropdown's Area option on a scanned PDF.
 5. Reopen the experimental notebook and check the shape positions; test zoom, page switch, OCR and Undo/Redo.
 6. Repeat on converted DOCX and EPUB PDFs after conversion has preserved text.
+
+## v0.8.4c performance follow-up
+
+Mouse-driven glyph selection now queries a bounded 48-row index rather than
+scanning every glyph on each drag event. The index is prepared inside the
+PDFium worker and discarded with the active page. Copy Text and highlight
+geometry remain unchanged.

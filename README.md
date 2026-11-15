@@ -7,26 +7,24 @@
 
   *Import readings. Highlight pages. Write notes. Tick off your progress. Share a whole week's materials with your classmates.*
 
-  **v0.8.2 source · Next public preview in preparation · pre-1.0**
+  **v0.8.5 reliability/performance release candidate · Latest published v0.8.3b · pre-1.0**
 </div>
 
 ## ⬇️ Get Yomu Note
 
-**Currently published installers: v0.8.1b-rc4.** The next release,
-**v0.8.2 with Reading View Memory**, is in testing. Its installers aren't
-publicly available until the draft release is verified and published.
+**Current published pre-release: v0.8.3b (Text Lab).** The v0.8.5 reliability and performance improvements are ready for GitHub
+CI and installer acceptance testing, but are not yet a published installer.
 
-| Platform | Download (currently published v0.8.1b-rc4) | Installation |
+| Platform | Published v0.8.3b download | Installation |
 | --- | --- | --- |
-| **Windows 10/11 (64-bit)** | [Download Windows installer (.exe)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.1b-rc4/YomuNote_Setup_v0.8.1b.exe) | Install and launch from Start |
-| **macOS — Apple Silicon (M-series)** | [Download Apple Silicon (.dmg)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.1b-rc4/YomuNote-0.8.1b-macOS-arm64-unsigned.dmg) | Drag Yomu Note to Applications |
-| **macOS — Intel** | [Download Intel Mac (.dmg)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.1b-rc4/YomuNote-0.8.1b-macOS-x86_64-unsigned.dmg) | Drag Yomu Note to Applications |
-| **Linux** | [Run/build from source](docs/INSTALL.md) (no AppImage) | Follow the Linux instructions |
+| **Windows 10/11 (64-bit)** | [Windows installer (.exe)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.3b/YomuNote_Setup_v0.8.3b.exe) | Install; launch from Start menu after Setup closes |
+| **macOS — Apple Silicon** | [Apple Silicon (.dmg)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.3b/YomuNote-0.8.3b-macOS-arm64-unsigned.dmg) | Drag Yomu Note to Applications |
+| **macOS — Intel** | [Intel Mac (.dmg)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.3b/YomuNote-0.8.3b-macOS-x86_64-unsigned.dmg) | Drag Yomu Note to Applications |
+| **Linux** | [Run/build from source](docs/INSTALL.md) | Linux source only; no AppImage |
 
-> **Preview release:** Windows and macOS installers are unsigned; macOS builds
-> are not notarised. The current installer does **not** yet include v0.8.2's
-> Reading View Memory feature. See [all releases](https://github.com/alteredwavestudios/Yomu-Note/releases) and
-> [installation help](docs/INSTALL.md).
+> **Preview warning:** The installers are unsigned and macOS builds are not notarised.
+> Test v0.8.5 with a copy of a notebook. Source compatibility remains v5; no
+> database schema migration has been introduced.
 
 ## Take a look
 
@@ -67,7 +65,9 @@ Choose your theme, typography and how lively you want the reading rewards to fee
 - **Portable, shareable notebooks:** Full `.yomunote` projects and individual tab exchange, with one-step Undo/Redo for imported batches.
 - **Smart Import 3.0:** Choose PDF page ranges and bookmark chapters, or keep all pages by default.
 - **Reading navigator:** Nested groups, page thumbnails, drag-and-drop ordering, titles and reading progress.
-- **Reading View Memory (v0.8.2 source):** Remember each page’s scroll position and share zoom across a root group, with individual overrides.
+- **Reading View Memory:** Remember each page’s scroll position and share zoom across a root group, with individual overrides.
+- **Text Lab:** Select, copy and highlight native PDF text; gracefully fall back to OCR on image-only pages.
+- **Reliability/performance (v0.8.5 release candidate):** Validate original assets; make cross-tab transfers transactional and undoable; clear the preview on an empty-tab Undo; batch multi-tab saves; accelerate PDF text selection; run idle autosaves and Tab Exchange finalisation off the GUI thread using bounded snapshots; release inactive Groups thumbnails and prune disposable JPEG caches.
 - **Document annotation:** Highlights, drawings, shapes and page-relative annotations.
 - **Rich-text notes:** Multiple notes pages per tab, tables, links, typography, formatting and editor Undo/Redo.
 - **Offline OCR:** Text extraction from PDF/image selections with adjustable DPI and a review-and-copy step.
@@ -95,7 +95,8 @@ See the illustrated **[5-minute quick start](docs/QUICK_START.md)** for the main
 - [Beginner's architecture walkthrough](BEGINNERS_ARCHITECTURE_GUIDE.md)
 - [Contributing and running tests](CONTRIBUTING.md)
 - [Security and responsible disclosure](SECURITY.md)
-- [Upcoming v0.8.2 release notes](RELEASE_NOTES_v0.8.2.md)
+- [v0.8.5 release candidate notes](RELEASE_NOTES_v0.8.5.md)
+- [v0.8.3b Text Lab release notes](RELEASE_NOTES_v0.8.3b.md)
 - [v0.8.1b release notes](RELEASE_NOTES_v0.8.1b.md)
 - [Previous versions and QA notes](docs/HISTORY.md)
 
@@ -116,6 +117,6 @@ The repository also includes `run-windows.bat`, `run-mac.command` and `run-linux
 
 This is an early public preview, **not v1.0**. The underlying notebook file format is 5, and `.yomunote` saves record the producing application version separately. Back up important notebooks before upgrading. Some Microsoft Office and EPUB imports require converters installed on the user's computer. Notebooks from strangers can contain malicious input; the application is not a security sandbox.
 
-Current development priorities include sticky-note/photo annotations, voice dictation and further recovery/performance hardening. The [pre-GitHub security audit](SECURITY_AUDIT_081A.md) documents outstanding issues.
+Current development priorities include remaining persistence/performance hardening, clipboard image insertion and offline voice dictation. The [pre-GitHub security audit](SECURITY_AUDIT_081A.md) documents outstanding issues.
 
 **Licence:** Yomu Note’s original source code is licensed under **[GNU GPL v3.0 or later](LICENSE)** (`GPL-3.0-or-later`). Third-party libraries, PDF/OCR components and fonts retain their own licences; see [third-party notices](THIRD_PARTY_NOTICES.md) and [licensing details](LICENSING_DECISION.md). Files created by users are not automatically GPL-licensed.
