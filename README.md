@@ -1,122 +1,67 @@
-<div align="center">
-  <img src="assets/icon.png" alt="Yomu Note icon" width="96">
+Pinbu Note ♥
+ピンブノート
 
-  # Yomu Note 🌸
+Little pieces, big ideas.
 
-  **A cosy, offline-first reading and study notebook — made to share.**
+A cosy, offline study companion for Windows and macOS. Organise your readings, annotate documents, collect notes and stitch your ideas together.
 
-  *Import readings. Highlight pages. Write notes. Tick off your progress. Share a whole week's materials with your classmates.*
+Current version: v0.8.7c
 
-  **v0.8.5 reliability/performance release candidate · Latest published v0.8.3b · pre-1.0**
-</div>
+Highlights: Three-column workspace, PDF and document importing, OCR, rich-text notes, movable sticky notes, bookmarks, reading progress, Pomodoro, notebook exchange, custom themes and flexible page scrolling.
 
-## ⬇️ Get Yomu Note
+Theme collections: Japanese & Kawaii, Pinbu Textiles, French Art Nouveau, Modern & System.
 
-**Current published pre-release: v0.8.3b (Text Lab).** The v0.8.5 reliability and performance improvements are ready for GitHub
-CI and installer acceptance testing, but are not yet a published installer.
+## What's new
 
-| Platform | Published v0.8.3b download | Installation |
-| --- | --- | --- |
-| **Windows 10/11 (64-bit)** | [Windows installer (.exe)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.3b/YomuNote_Setup_v0.8.3b.exe) | Install; launch from Start menu after Setup closes |
-| **macOS — Apple Silicon** | [Apple Silicon (.dmg)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.3b/YomuNote-0.8.3b-macOS-arm64-unsigned.dmg) | Drag Yomu Note to Applications |
-| **macOS — Intel** | [Intel Mac (.dmg)](https://github.com/alteredwavestudios/Yomu-Note/releases/download/v0.8.3b/YomuNote-0.8.3b-macOS-x86_64-unsigned.dmg) | Drag Yomu Note to Applications |
-| **Linux** | [Run/build from source](docs/INSTALL.md) | Linux source only; no AppImage |
+- Responsive **Pinbu ♥ / NOTE** wordmark and new patchwork mascot icon.
+- Three low-noise patchwork themes: **Pinbu Patchwork**, **Silk Sampler** and
+  **Indigo Stitch**, with visually distinct pane surfaces and calm editor paper.
+- Sticky notes: edit font size from Quick Edit; improved bullets and lighter preview;
+  choose location with a click after writing; saved positions now
+  move and resize through Select; configurable paper background, alignment,
+  plain-text bullet toggling and percentage-based font tracking.
+- Bookmarks now show a small ribbon on the page thumbnail and preview.
+- New notebooks created from the GUI use `.pinbunote`. Existing `.yomunote`
+  and `.yominote` files remain supported for opening and tab importing.
+- App-specific settings are stored separately; non-sensitive visual preferences
+  can be copied from the older Yomu Note settings without modifying them.
 
-> **Preview warning:** The installers are unsigned and macOS builds are not notarised.
-> Test v0.8.5 with a copy of a notebook. Source compatibility remains v5; no
-> database schema migration has been introduced.
+## Build
 
-## Take a look
+Install Python 3.12 and dependencies from `requirements.txt`, then run
+`python main.py`. On Windows run `run-windows.bat` followed by
+`build-windows.ps1` and `build-installer-windows.ps1`. On macOS run
+`run-mac.command` followed by `build-mac.command` and
+`scripts/package-macos-dmg.sh`. Native OCR assets are assembled only
+on the target platform. GitHub Actions can build all installable assets
+from a version tag; its draft-release workflow never publishes automatically.
 
-### 1. All your studying in one place
+**Compatibility caution:** do not open the same notebook simultaneously in
+an older Yomu Note process and Pinbu Note. v0.8.6b introduced a per-file
+lock, but older released versions do not cooperate with that lock.
 
-![Yomu Note's three-panel interface: reading navigator, PDF with annotations, and rich-text notes editor](docs/screenshots/01-interface.png)
+## Historical Yomu Note source documentation
 
-PDF preview in the middle, organised reading material on the left, and formatted notes on the right. Work on a chapter without losing the rest of your notebook.
+The original user and developer documentation remains in this archive, with
+historical screenshots and release notes retained for context. See
+`RELEASE_NOTES_v0.8.7b.md`, `START-HERE-v0.8.6b.md`, and
+`docs/BUILD_RELEASES.md`.
 
-### 2. Select text with offline OCR
+---
 
-![OCR recognition dialog showing text selected from a scanned PDF and available for correction and copying](docs/screenshots/02-ocr.png)
+**v0.8.6b baseline:** Historical user manuals and screenshots are included in
+`docs/`, but they may still show the earlier Yomu Note interface. The present
+source package is a separate, unpublished Pinbu Note development candidate.
 
-Select text directly from scanned PDFs or images, review the recognised words, and copy them into your notes. OCR runs locally using Tesseract. Windows and macOS installers bundle an English model. Linux source users install Tesseract locally (see the installation guide).
+## Historical release and visual reference
 
-### 3. Chapters, checklists and reading progress
+The last previously published Yomu Note release was **v0.8.3b**; its
+[downloads](https://github.com/alteredwavestudios/Yomu-Note/releases/tag/v0.8.3b)
+remain historical and have not been replaced by this source candidate.
+The v0.8.6b baseline added **Reading View Memory** and sticky notes.
+Screenshots of the earlier interface (not the new patchwork branding):
 
-![Expanded page navigator with nested chapter groups, checked pages, and reading completion percentages](docs/screenshots/03-reading-progress.png)
-
-Organise pages into chapters and groups, track your reading with checkboxes, and watch your group, tab and notebook completion percentages update.
-
-### 4. Share complete tabs with classmates
-
-![File menu showing Open Project, Import Tabs from Notebook, and Export Selected Tabs as Notebook](docs/screenshots/04-tab-exchange.png)
-
-**File → Import Tabs from Notebook…** lets you choose individual tabs from a `.yomunote` project; **Export Selected Tabs as Notebook…** creates a shareable project with only the tabs you choose. Source pages, groups, annotations and rich-text notes travel together. You can also drag a `.yomunote` file onto the window to review its tabs.
-
-<details>
-<summary>More: colours and settings</summary>
-
-![Appearance preferences with themes, default notes font and optional reading celebration settings](docs/screenshots/05-preferences.png)
-
-Choose your theme, typography and how lively you want the reading rewards to feel.
-</details>
-
-## Features
-
-- **Portable, shareable notebooks:** Full `.yomunote` projects and individual tab exchange, with one-step Undo/Redo for imported batches.
-- **Smart Import 3.0:** Choose PDF page ranges and bookmark chapters, or keep all pages by default.
-- **Reading navigator:** Nested groups, page thumbnails, drag-and-drop ordering, titles and reading progress.
-- **Reading View Memory:** Remember each page’s scroll position and share zoom across a root group, with individual overrides.
-- **Text Lab:** Select, copy and highlight native PDF text; gracefully fall back to OCR on image-only pages.
-- **Reliability/performance (v0.8.5 release candidate):** Validate original assets; make cross-tab transfers transactional and undoable; clear the preview on an empty-tab Undo; batch multi-tab saves; accelerate PDF text selection; run idle autosaves and Tab Exchange finalisation off the GUI thread using bounded snapshots; release inactive Groups thumbnails and prune disposable JPEG caches.
-- **Document annotation:** Highlights, drawings, shapes and page-relative annotations.
-- **Rich-text notes:** Multiple notes pages per tab, tables, links, typography, formatting and editor Undo/Redo.
-- **Offline OCR:** Text extraction from PDF/image selections with adjustable DPI and a review-and-copy step.
-- **Focus tools:** Pomodoro timer and optional gentle reading rewards.
-- **Offline-first:** No account, server or cloud connection required for normal reading, notes, tab exchange or OCR.
-
-See the illustrated **[5-minute quick start](docs/QUICK_START.md)** for the main workflow, or the [complete feature guide](docs/FEATURE_GUIDE.md).
-
-## Start sharing readings
-
-1. Prepare a tab with your reading and notes (for example, “Week 4 — Weber”).
-2. Choose **File → Export Selected Tabs as Notebook…** and tick only what you want to share.
-3. Send the exported `.yomunote` file through your class chat or shared drive.
-4. The recipient opens their own project and chooses **File → Import Tabs from Notebook…** (or drops the file onto Yomu Note).
-5. They select the tabs, review the import, and add them without overwriting their existing work. One Undo reverses the import batch.
-
-**Privacy and copyright:** Sharing a tab includes its underlying reading files and your notes/annotations. Check that you have permission to redistribute lecture slides, articles and books, and review notes for personal information before exporting.
-
-## Documentation
-
-- [Installation on Windows, macOS and Linux](docs/INSTALL.md)
-- [Quick start with screenshots](docs/QUICK_START.md)
-- [Features and shortcuts](docs/FEATURE_GUIDE.md)
-- [Build and publish downloadable installers](docs/BUILD_RELEASES.md)
-- [Beginner's architecture walkthrough](BEGINNERS_ARCHITECTURE_GUIDE.md)
-- [Contributing and running tests](CONTRIBUTING.md)
-- [Security and responsible disclosure](SECURITY.md)
-- [v0.8.5 release candidate notes](RELEASE_NOTES_v0.8.5.md)
-- [v0.8.3b Text Lab release notes](RELEASE_NOTES_v0.8.3b.md)
-- [v0.8.1b release notes](RELEASE_NOTES_v0.8.1b.md)
-- [Previous versions and QA notes](docs/HISTORY.md)
-
-## Build from source
-
-If you want to contribute or no release installer is available yet, you need **Python 3.10+** and an environment that can install PySide6/PDFium/Pillow:
-
-```bash
-python -m venv .venv
-# Activate .venv for your system, then:
-python -m pip install -r requirements.txt
-python main.py
-```
-
-The repository also includes `run-windows.bat`, `run-mac.command` and `run-linux.sh` helpers, plus native build scripts. Details: [docs/BUILD_RELEASES.md](docs/BUILD_RELEASES.md).
-
-## Status and known limits
-
-This is an early public preview, **not v1.0**. The underlying notebook file format is 5, and `.yomunote` saves record the producing application version separately. Back up important notebooks before upgrading. Some Microsoft Office and EPUB imports require converters installed on the user's computer. Notebooks from strangers can contain malicious input; the application is not a security sandbox.
-
-Current development priorities include remaining persistence/performance hardening, clipboard image insertion and offline voice dictation. The [pre-GitHub security audit](SECURITY_AUDIT_081A.md) documents outstanding issues.
-
-**Licence:** Yomu Note’s original source code is licensed under **[GNU GPL v3.0 or later](LICENSE)** (`GPL-3.0-or-later`). Third-party libraries, PDF/OCR components and fonts retain their own licences; see [third-party notices](THIRD_PARTY_NOTICES.md) and [licensing details](LICENSING_DECISION.md). Files created by users are not automatically GPL-licensed.
+- ![Historical three-column interface](docs/screenshots/01-interface.png)
+- ![Historical OCR dialog](docs/screenshots/02-ocr.png)
+- ![Historical reading-progress UI](docs/screenshots/03-reading-progress.png)
+- ![Historical tab exchange](docs/screenshots/04-tab-exchange.png)

@@ -23,12 +23,12 @@ def log_folder() -> Path:
     if sys.platform == 'win32':
         parent = Path(os.environ.get('LOCALAPPDATA',
                       str(Path.home() / 'AppData' / 'Local')))
-        return parent / 'Yomu Note' / 'Logs'
+        return parent / 'Pinbu Note' / 'Logs'
     if sys.platform == 'darwin':
-        return Path.home() / 'Library' / 'Logs' / 'Yomu Note'
+        return Path.home() / 'Library' / 'Logs' / 'Pinbu Note'
     parent = Path(os.environ.get('XDG_STATE_HOME',
                   str(Path.home() / '.local' / 'state')))
-    return parent / 'yomu-note' / 'logs'
+    return parent / 'pinbu-note' / 'logs'
 
 
 def get_logger() -> logging.Logger:

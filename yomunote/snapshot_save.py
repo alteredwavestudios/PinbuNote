@@ -14,6 +14,7 @@ import os
 import sqlite3
 import stat
 import threading
+from .notebook_lock import disk_signature, NotebookExternallyModifiedError
 from contextlib import closing
 
 CHUNK = 1024 * 1024
@@ -34,6 +35,7 @@ class SaveGuard:
     lock: threading.RLock = field(default_factory=threading.RLock)
     generation: int = 0
     closed: bool = False
+    disk_identity: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,11 @@ def write_snapshot(snapshot: SaveSnapshot) -> SaveResult:
         if snapshot.guard.closed or snapshot.guard.generation != snapshot.generation:
             return SaveResult(False, False, {}, {}, snapshot.manifest,
                               snapshot.guard.generation)
+        if disk_signature(snapshot.path) != snapshot.guard.disk_identity:
+            raise NotebookExternallyModifiedError(
+                'The notebook changed on disk while it was open. Autosave was stopped '
+                'to avoid overwriting edits from another version. Close the other '
+                'application and recover from your backup before continuing.')
         changed = snapshot.manifest != snapshot.previous_manifest
         stats = dict(snapshot.saved_stats)
         hashes = dict(snapshot.saved_hashes)
@@ -174,6 +181,7 @@ def write_snapshot(snapshot: SaveSnapshot) -> SaveResult:
                 if changed:
                     conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
                                  ('manifest', snapshot.manifest))
+        snapshot.guard.disk_identity = disk_signature(snapshot.path)
         snapshot.guard.generation += 1
         return SaveResult(True, changed, stats, hashes, snapshot.manifest,
                           snapshot.guard.generation)

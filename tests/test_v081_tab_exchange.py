@@ -90,6 +90,24 @@ def test_inspection_and_single_tab_export_contains_all_content_and_no_private_fi
         source.close()
 
 
+def _read_only_saved_tabs(path):
+    """Inspect SQLite without opening a *second editable* notebook session.
+
+    Since v0.8.6b Notebook.load rightly refuses another live editor, these
+    older persistence assertions must instead read the database in ro mode.
+    """
+    with sqlite3.connect(Path(path).as_uri() + '?mode=ro', uri=True) as conn:
+        meta = json.loads(conn.execute(
+            'SELECT value FROM meta WHERE key=?', ('manifest',)).fetchone()[0])
+        projects = {}
+        for tab in meta['tabs']:
+            row = conn.execute('SELECT data FROM files WHERE path=?',
+                               (f'tabs/{tab["id"]}/project.json',)).fetchone()
+            if row:
+                projects[tab['id']] = json.loads(row[0])
+        return meta['tabs'], projects
+
+
 def test_stage_import_and_one_batch_undo_redo_preserves_edits(tmp_path):
     source, ids = populated_notebook(tmp_path)
     receiving = Notebook.create(tmp_path / 'target', 'My semester')
@@ -116,20 +134,14 @@ def test_stage_import_and_one_batch_undo_redo_preserves_edits(tmp_path):
         assert [t['id'] for t in receiving.tabs] == [existing]
         # Still in working directory for in-session Redo, not in the SQLite file.
         assert (receiving.workspace/'tabs'/imported[0]['id']/'project.json').exists()
-        reopened = Notebook.load(receiving.path)
-        try:
-            assert len(reopened.tabs) == 1
-        finally:
-            reopened.close()
+        saved_tabs, _ = _read_only_saved_tabs(receiving.path)
+        assert len(saved_tabs) == 1
         set_batch_present(receiving, imported, True, 1)
         assert len(receiving.tabs) == 3
         assert '<strong>My edited notes</strong>' in receiving.project(imported[0]['id']).notes_html
-        reopened = Notebook.load(receiving.path)
-        try:
-            assert len(reopened.tabs) == 3
-            assert reopened.project(imported[0]['id']).notes_html == rich.notes_html
-        finally:
-            reopened.close()
+        saved_tabs, saved_projects = _read_only_saved_tabs(receiving.path)
+        assert len(saved_tabs) == 3
+        assert saved_projects[imported[0]['id']]['notes_html'] == rich.notes_html
     finally:
         receiving.close()
         source.close()
@@ -200,7 +212,8 @@ def test_failed_sqlite_commit_rolls_back_all_tab_changes(tmp_path, monkeypatch):
         assert recv.tabs == old
         assert not (recv.workspace/'tabs'/entries[0]['id']).exists()
         monkeypatch.setattr(recv, 'save', real_save)
-        assert len(Notebook.load(recv.path).tabs) == 1
+        saved_tabs, _ = _read_only_saved_tabs(recv.path)
+        assert len(saved_tabs) == 1
     finally:
         recv.close()
         src.close()
@@ -296,11 +309,8 @@ def test_undo_failure_preserves_live_tab_manifest(tmp_path, monkeypatch):
         assert receiving.tabs == before
         assert receiving.active_id == previous
         monkeypatch.setattr(receiving, 'save', real_save)
-        loaded = Notebook.load(receiving.path)
-        try:
-            assert len(loaded.tabs) == 2
-        finally:
-            loaded.close()
+        saved_tabs, _ = _read_only_saved_tabs(receiving.path)
+        assert len(saved_tabs) == 2
     finally:
         receiving.close()
         source.close()

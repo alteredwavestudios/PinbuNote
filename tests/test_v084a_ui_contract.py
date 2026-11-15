@@ -35,7 +35,7 @@ def test_replay_is_one_notebook_wide_change_without_editor_reload():
 
 
 def test_production_installer_guards_unchanged():
-    installer = (ROOT / 'YomuNote_v050_Installer.iss').read_text()
+    installer = (ROOT / 'PinbuNote_Installer.iss').read_text()
     build = (ROOT / 'build-installer-windows.ps1').read_text()
     assert 'AppId={{974AD665-3F47-4CC5-9AAE-0A5F43565469}' in installer
     assert '[Run]' not in '\n'.join(line.strip() for line in installer.splitlines()

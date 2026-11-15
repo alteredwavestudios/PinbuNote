@@ -13,6 +13,10 @@ installer/
 *.spec
 
 # Personal notebooks, legacy projects and recovery files
+*.pinbunote
+*.pinbunote.*
+*.pinbunote-shm
+*.pinbunote-wal
 *.yomunote
 *.yomunote.*
 *.yominote

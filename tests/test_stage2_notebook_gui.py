@@ -22,7 +22,7 @@ def window(tmp_path, monkeypatch):
     notebook = Notebook.create(tmp_path / 'notebooks', 'GUI Test Notebook')
     notebook_path = notebook.path
     notebook.close()
-    settings = window_module.QSettings('Yomu Note', 'Yomu Note')
+    settings = window_module.QSettings('Pinbu Note', 'Pinbu Note')
     settings.setValue('preferencesMigrated', True)
     settings.setValue('openProjects', [str(notebook_path)])
     settings.sync()

@@ -52,9 +52,9 @@ def restore_matching_python_sqlite(distribution: Path, interpreter_root: Path) -
 
 
 def smoke_test(distribution: Path) -> dict:
-    executable = distribution / 'Yomu Note.exe'
+    executable = distribution / 'Pinbu Note.exe'
     if not executable.is_file():
-        raise RuntimeError(f'No frozen Yomu Note executable: {executable}')
+        raise RuntimeError(f'No frozen Pinbu Note executable: {executable}')
     # Do not borrow the builder's Python modules or Tesseract installations.
     environment = os.environ.copy()
     for var in ('PYTHONPATH', 'PYTHONHOME', 'TESSDATA_PREFIX',
@@ -64,7 +64,7 @@ def smoke_test(distribution: Path) -> dict:
     environment['PATH'] = str(windir / 'System32') + os.pathsep + str(windir)
     with tempfile.TemporaryDirectory(prefix='yomu-installed-smoke-') as folder:
         marker = Path(folder) / 'result.json'
-        args = [str(executable), '--yomu-bundle-smoke', str(marker)]
+        args = [str(executable), '--pinbu-bundle-smoke', str(marker)]
         try:
             result = subprocess.run(args, cwd=distribution, env=environment,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

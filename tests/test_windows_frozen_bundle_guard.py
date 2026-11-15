@@ -11,7 +11,7 @@ def test_runtime_selftest_executes_before_gui_imports():
     # without creating a MainWindow or touching an existing notebook.
     assert '--yomu-bundle-smoke' in source
     assert "sqlite3.connect(':memory:')" in source
-    assert source.index("if __name__ == '__main__' and '--yomu-bundle-smoke'") < source.index('from PySide6.QtGui')
+    assert source.index("if __name__ == '__main__' and any(flag in sys.argv") < source.index('from PySide6.QtGui')
     ast.parse(source)
 
 

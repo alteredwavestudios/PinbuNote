@@ -12,6 +12,8 @@ import os
 import json
 import math
 import copy
+import base64
+import tempfile
 from uuid import uuid4
 import threading
 import shutil
@@ -20,7 +22,7 @@ import time
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import (Qt, QSize, QTimer, QSettings, QUrl, Signal, QPoint, QPointF, QRectF, QEvent, QSignalBlocker,
-                            QPropertyAnimation, QEasingCurve, QThreadPool, QVariantAnimation, QRect, QAbstractAnimation, QMimeData)
+                            QPropertyAnimation, QEasingCurve, QThreadPool, QVariantAnimation, QRect, QAbstractAnimation, QMimeData, QBuffer, QByteArray, QIODevice)
 from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QIcon, QPainter, QPen,
                            QKeySequence, QPixmap, QFont, QPainterPath, QImage, QImageReader, QShortcut, QTextCursor, QTextDocument, QPen, QLinearGradient, QCursor, QPalette, QDrag, QUndoStack, QUndoCommand)
 from PySide6.QtWidgets import (
@@ -35,12 +37,12 @@ from .editor import NotesEditor
 from .notes_layout import NotesPageSetup
 from .notes_layout_dialog import NotesPageSetupDialog
 from .platform_shortcuts import IS_MAC, PRIMARY, ALT, SHIFT, docs_shortcut
-from .ui import FlowLayout, WrapBar, YomuWordmark, SaveToast, SoftButtonMotion, ColourDotButton, line_icon, FocusTimer, FocusFlower, ConfettiOverlay, ReadingProgressBar, KawaiiNotice
+from .ui import FlowLayout, WrapBar, PinbuWordmark, SaveToast, SoftButtonMotion, ColourDotButton, line_icon, FocusTimer, FocusFlower, ConfettiOverlay, ReadingProgressBar, KawaiiNotice
 from .importers import (ALL_EXTS, blank_page, import_document, image_for_page,
                         clear_obsolete_preview_tiers, trim_disposable_caches,
                         LARGE_THUMB_MAX_WIDTH)
 from .project import Project, PANEL_KEYS, valid_panel_order, short_id, validated_note_pages
-from .reading_view import (empty_view, effective_zoom, remember_zoom,
+from .reading_view import (extra_vertical_scene_padding, empty_view, effective_zoom, remember_zoom,
                            normalise_zoom, fit_zoom, root_for_page,
                            root_for_group, pages_in_group,
                            set_page_independent, set_root_shared)
@@ -62,8 +64,13 @@ from .page_groups import (
     rename_group as change_group_name,
     move_pages_to_group, move_pages_to_root, ungroup as dissolve_group,
     remove_group_and_pages, set_collapsed, move_group, page_node,
+    group_extra_vertical_scroll, page_extra_vertical_scroll,
+    set_group_extra_vertical_scroll,
 )
 from .notebook import Notebook, MAX_TABS, default_backup_folder
+from .notebook_lock import NotebookInUseError, NotebookExternallyModifiedError
+from .sticky_note_dialog import StickyNoteDialog
+from .bookmark_badge import paint_bookmark_ribbon
 from .tab_exchange import (inspect_notebook, stage_import, commit_import,
                            set_batch_present, export_tabs)
 from .tab_exchange_dialog import TabExchangeDialog
@@ -73,7 +80,7 @@ from .diagnostics import logger, log_folder
 from .resampling import bicubic_rgb_crop, MAX_UPSCALE_SOURCE_PIXELS, MAX_UPSCALE_OUTPUT_PIXELS
 from .preview_clarity import sharpen_cached_preview, MODES as CLARITY_MODES
 from .history import UnifiedHistory, CallbackAction, external_undo_action, rename_action, reorder_pages_action
-from .vector_marks import (make_stroke, make_shape, make_highlight, make_highlight_line, translated_vector,
+from .vector_marks import (make_stroke, make_shape, make_highlight, make_highlight_line, make_photo, make_sticky, MAX_PHOTO_JPEG_BYTES, translated_vector,
                            resized_vector, MAX_STROKE_POINTS,
                            add_mark, remove_stroke, restore_stroke, valid_vector)
 from .layout_geometry import fit_inside, is_near_native_pixel_ratio
@@ -81,6 +88,54 @@ from .tab_strip import inline_add_position
 from .ocr_engine import (MAX_REGIONS, OCR_DPI, find_tesseract, installed_languages,
                          recognise_regions, OCRCancelled)
 from .pdf_text_engine import inspect_page
+
+# Clipboard JPEGs are source material (not disposable preview caches).
+# Keep a single image page <= 5 MiB and one inline photo <= 320 KiB.
+CLIPBOARD_PAGE_MAX_BYTES = 5 * 1024 * 1024
+CLIPBOARD_IMAGE_MAX_PIXELS = 40_000_000
+
+
+def _clipboard_jpeg(*, photo=False):
+    """Capture the OS clipboard exclusively on the Qt/GUI thread.
+
+    Normalise transparent screenshots to white, downscale before compression,
+    and reject oversized payloads rather than putting arbitrary bytes in
+    notebook JSON. Return (jpeg bytes, width, height).
+    """
+    clipboard = QApplication.clipboard()
+    if clipboard is None or not clipboard.mimeData().hasImage():
+        raise ValueError('Copy an image or screenshot to the clipboard first.')
+    image = clipboard.image()
+    if image.isNull() or image.width() <= 0 or image.height() <= 0:
+        raise ValueError('The clipboard does not contain a readable image.')
+    if image.width() * image.height() > CLIPBOARD_IMAGE_MAX_PIXELS:
+        raise ValueError('Clipboard image exceeds the 40-megapixel safety limit.')
+    limit = MAX_PHOTO_JPEG_BYTES if photo else CLIPBOARD_PAGE_MAX_BYTES
+    longest = 1600 if photo else 3200
+    for attempt in range(7):
+        reduced = image.scaled(
+            min(image.width(), longest), min(image.height(), longest),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        opaque = QImage(reduced.size(), QImage.Format.Format_RGB32)
+        opaque.fill(Qt.GlobalColor.white)
+        painter = QPainter(opaque)
+        painter.drawImage(0, 0, reduced)
+        painter.end()
+        payload = QByteArray()
+        buffer = QBuffer(payload)
+        if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            raise ValueError('Could not encode the clipboard image.')
+        quality = max(54, 86 - attempt*6)
+        saved = opaque.save(buffer, 'JPEG', quality)
+        buffer.close()
+        data = bytes(payload)
+        width, height = opaque.width(), opaque.height()
+        if saved and len(data) <= limit:
+            return data, width, height
+        longest = max(400 if photo else 800, int(longest * .80))
+    raise ValueError('Image is too complex to fit within the safe JPEG size limit.')
+
 
 THUMB_LIMIT = 20
 # Only one large page pixmap stays in RAM. Adjacent pages are pre-rendered on disk.
@@ -246,6 +301,100 @@ THEMES.update({
                       'btn2': '#5e4778', 'preview': '#18142b'},
 })
 
+# Textile-inspired palettes: distinct shelf / canvas / notes-backdrop patches.
+# Content paper stays neutral for long-focus readability; no busy patterns.
+THEMES.update({
+    'pinbu-quilt': {'name': 'Pinbu Patchwork', 'window': '#f7f1eb',
+        'panel': '#e8efe3', 'paper': '#fffdfa', 'shelf': '#efd9df',
+        'canvas': '#dce8ee', 'ink': '#332f41', 'muted': '#615c6c',
+        'accent': '#9f4c6c', 'accent2': '#496f88', 'border': '#b7aeba',
+        'highlight': '#f3dae6', 'btn': '#fffaf7', 'btn2': '#e8dce7',
+        'preview': '#d5e4ec'},
+    'silk-sampler': {'name': 'Silk Sampler', 'window': '#f7eee1',
+        'panel': '#ebe1f1', 'paper': '#fffdfa', 'shelf': '#f3e1d1',
+        'canvas': '#d7eae3', 'ink': '#393447', 'muted': '#5c596a',
+        'accent': '#8f4f77', 'accent2': '#3b8074', 'border': '#bfb4c8',
+        'highlight': '#f4deed', 'btn': '#fffaf4', 'btn2': '#e8dcea',
+        'preview': '#d2e6df'},
+    'indigo-stitch': {'name': 'Indigo Stitch', 'window': '#1e2732',
+        'panel': '#363143', 'paper': '#313a46', 'shelf': '#293b51',
+        'canvas': '#273d43', 'ink': '#f4f1ec', 'muted': '#c4c5d2',
+        'accent': '#eda5bd', 'accent2': '#9cc7c1', 'border': '#647184',
+        'highlight': '#4d4a65', 'btn': '#40495a', 'btn2': '#53536c',
+        'preview': '#1f353d'},
+})
+
+# Additional calming textile and French Art Nouveau palettes.  The three
+# workspace panels are deliberately different fabrics (shelf/canvas/panel),
+# but content surfaces, controls and text retain high readability.
+THEMES.update({
+    'pinbu-applique': {'name': 'Appliqué Morning', 'window': '#f4ede9',
+        'panel': '#edf0df', 'paper': '#fffefa', 'shelf': '#e9d8e8',
+        'canvas': '#dbe9e8', 'ink': '#383344', 'muted': '#615b6b',
+        'accent': '#86538c', 'accent2': '#41766f', 'border': '#beb3be',
+        'highlight': '#eedbeb', 'btn': '#fffdf8', 'btn2': '#e9deea',
+        'preview': '#dbe6e4'},
+    'pinbu-peachwork': {'name': 'Peachwork Linen', 'window': '#f9efe4',
+        'panel': '#eee8d8', 'paper': '#fffdf8', 'shelf': '#f1ded4',
+        'canvas': '#e3e8dc', 'ink': '#46342e', 'muted': '#6a5954',
+        'accent': '#9b514f', 'accent2': '#52796a', 'border': '#c5b4a4',
+        'highlight': '#f6ddc9', 'btn': '#fffaf4', 'btn2': '#f0e1d7',
+        'preview': '#e3e9dc'},
+    'pinbu-night-quilt': {'name': 'Night Quilt', 'window': '#272331',
+        'panel': '#373a36', 'paper': '#353a3b', 'shelf': '#3d2f43',
+        'canvas': '#283e49', 'ink': '#fcf3ec', 'muted': '#d3c5ce',
+        'accent': '#f1b3c8', 'accent2': '#9ad9cc', 'border': '#756b7c',
+        'highlight': '#59485d', 'btn': '#493e50', 'btn2': '#5a4b60',
+        'preview': '#253841'},
+    'pinbu-moon-sampler': {'name': 'Moonlit Sampler', 'window': '#202c35',
+        'panel': '#383646', 'paper': '#313e44', 'shelf': '#303a51',
+        'canvas': '#24413d', 'ink': '#f7f1e6', 'muted': '#c4cdd0',
+        'accent': '#e4ba88', 'accent2': '#9bcbbb', 'border': '#657782',
+        'highlight': '#4a5961', 'btn': '#3c4b53', 'btn2': '#51626a',
+        'preview': '#1d3433'},
+    'nouveau-iris': {'name': 'Iris & Pearl', 'window': '#f1edea',
+        'panel': '#f1eee4', 'paper': '#fffefa', 'shelf': '#e7ddea',
+        'canvas': '#ddeae3', 'ink': '#343849', 'muted': '#626074',
+        'accent': '#685b9c', 'accent2': '#4b8179', 'border': '#b8b3c4',
+        'highlight': '#e1dbf4', 'btn': '#fdfbf7', 'btn2': '#eae2f0',
+        'preview': '#dce7e0'},
+    'nouveau-ginkgo': {'name': 'Ginkgo & Gold', 'window': '#f1ecdb',
+        'panel': '#f3ecda', 'paper': '#fffdf4', 'shelf': '#e8e0c7',
+        'canvas': '#dfeadf', 'ink': '#343d34', 'muted': '#5b6653',
+        'accent': '#7e6531', 'accent2': '#47765c', 'border': '#bdb99d',
+        'highlight': '#eee2ba', 'btn': '#fffdf4', 'btn2': '#e9e4ca',
+        'preview': '#dde7dc'},
+    'nouveau-peacock': {'name': 'Peacock & Brass', 'window': '#1b2c36',
+        'panel': '#2d3840', 'paper': '#303d46', 'shelf': '#283b47',
+        'canvas': '#234443', 'ink': '#f8f4e9', 'muted': '#c4d6d1',
+        'accent': '#d9b77f', 'accent2': '#a0d6c9', 'border': '#607a77',
+        'highlight': '#405d60', 'btn': '#384b51', 'btn2': '#4a6264',
+        'preview': '#193b3c'},
+    'nouveau-velvet': {'name': 'Velvet Poppy', 'window': '#291f2d',
+        'panel': '#352d3f', 'paper': '#423746', 'shelf': '#442e3d',
+        'canvas': '#2f4348', 'ink': '#fbf2ed', 'muted': '#dbccd5',
+        'accent': '#f0bd99', 'accent2': '#a9cfbc', 'border': '#7b6576',
+        'highlight': '#60465b', 'btn': '#4d3e52', 'btn2': '#634d64',
+        'preview': '#253a3f'},
+})
+
+# Stable theme identifiers stay unchanged; only their presentation is grouped.
+THEME_PACKS = {
+    'Japanese & Kawaii': (
+        'washi', 'indigo', 'matcha', 'yuzu', 'lilac', 'asagao',
+        'ume', 'hinoki', 'sora', 'mizu', 'yoru', 'sumi', 'beni',
+        'aoi', 'shibui', 'strawberry', 'melon-soda', 'peach-mochi',
+        'candy-cloud', 'grape-fizz', 'arcade-hearts'),
+    'Pinbu Textiles': (
+        'pinbu-quilt', 'silk-sampler', 'indigo-stitch',
+        'pinbu-applique', 'pinbu-peachwork', 'pinbu-night-quilt',
+        'pinbu-moon-sampler'),
+    'French Art Nouveau': (
+        'nouveau-iris', 'nouveau-ginkgo', 'nouveau-peacock',
+        'nouveau-velvet'),
+    'Modern & System': ('modern-light', 'modern-dark', 'system'),
+}
+
 THEME_NAMES = {key: c['name'] for key, c in THEMES.items()}
 THEME_NAMES['system'] = 'Follow macOS / system'
 
@@ -268,7 +417,7 @@ def background_gradient(c):
 
 
 def application_palette(c: dict) -> QPalette:
-    """Give EVERY Qt widget the active Yomu Note colours.
+    """Give EVERY Qt widget the active Pinbu Note colours.
 
     A palette is Qt's fallback colour set. It is used by native Windows
     widgets and newly opened dialogs, including spin-box number fields.
@@ -811,6 +960,10 @@ class AnimatedPageDelegate(QStyledItemDelegate):
         painter.setPen(self.ink)
         painter.drawText(number_rect, Qt.AlignmentFlag.AlignCenter,
                          str(index.row() + 1))
+        # Draw over the existing thumbnail; never alter/copy its raster data.
+        if index.data(Qt.ItemDataRole.UserRole + 1):
+            paint_bookmark_ribbon(painter, row.right()-23, row.top()+8,
+                                  self.accent)
 
         if index.row() == self.hover_row and self.intensity:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1206,6 +1359,95 @@ class AnnotationOpacitySlider(QSlider):
         self.editFinished.emit()
 
 
+class PhotoAnnotationItem(QGraphicsPathItem):
+    """Photo is a selectable path item, so existing move/resize handles work."""
+    def __init__(self, mark, path):
+        super().__init__(path)
+        try:
+            data = base64.b64decode(mark['data'], validate=True)
+        except (ValueError, base64.binascii.Error):
+            data = b''
+        self._photo = QPixmap()
+        self._photo.loadFromData(data, 'JPEG')
+        self.setOpacity(float(mark.get('opacity', 100))/100)
+
+    def paint(self, painter, option, widget=None):
+        if self._photo.isNull():
+            return
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(self.path().boundingRect(), self._photo,
+                           QRectF(self._photo.rect()))
+
+
+class StickyAnnotationItem(QGraphicsPathItem):
+    """A little shaded paper square with a folded lower-right corner.
+
+    Painting is vector-only and tied to the page: no new cache or image asset.
+    The same QGraphicsPathItem selection/resize logic as photographs applies.
+    """
+    def __init__(self, mark, path):
+        super().__init__(path)
+        self.mark = dict(mark)
+        self.setOpacity(float(mark.get('opacity', 100)) / 100)
+
+    def paint(self, painter, option, widget=None):
+        rect = self.path().boundingRect()
+        if rect.isEmpty():
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        fold = min(rect.width(), rect.height()) * .14
+        pad = min(rect.width(), rect.height()) * .07
+        paper = rect.adjusted(0, 0, -fold*.25, -fold*.25)
+        show_paper = self.mark.get('show_background', True)
+        if show_paper:
+            shadow = paper.translated(fold*.22, fold*.30)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(85, 64, 43, 56))
+            painter.drawRoundedRect(shadow, 2.5, 2.5)
+            shade = QColor(self.mark['color'])
+            gradient = QLinearGradient(paper.topLeft(), paper.bottomRight())
+            gradient.setColorAt(0, shade.lighter(108))
+            gradient.setColorAt(.73, shade)
+            gradient.setColorAt(1, shade.darker(107))
+            painter.setBrush(QBrush(gradient))
+            painter.drawRoundedRect(paper, 2.2, 2.2)
+            from PySide6.QtGui import QPolygonF
+            from PySide6.QtCore import QPointF
+            fold_poly = QPolygonF([
+                QPointF(paper.right()-fold, paper.bottom()),
+                QPointF(paper.right(), paper.bottom()-fold),
+                paper.bottomRight()])
+            painter.setBrush(shade.darker(115))
+            painter.drawPolygon(fold_poly)
+        else:
+            shade = QColor('#FFFFFF')
+            paper = rect
+        ink = QColor('#2a302d') if shade.lightness() >= 125 else QColor('#ffffff')
+        painter.setPen(ink)
+        font = QFont(self.mark['font'])
+        # Fixed source-page point size; resizing changes wrapping, not font size.
+        original_page_width = rect.width() / max(.001, self.mark['w'])
+        font.setPixelSize(max(2, round(self.mark['font_size'] * original_page_width / 1000)))
+        font.setBold(self.mark['bold'])
+        font.setItalic(self.mark['italic'])
+        # Unlike an absolute pixel offset, percentage tracking stays relative
+        # to the real glyph size when the note's font-size preference changes.
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing,
+                              self.mark.get('letter_spacing_pct', 100))
+        painter.setFont(font)
+        text_rect = paper.adjusted(pad, pad, -pad,
+                                  -pad-(fold*.35 if show_paper else 0))
+        painter.save()
+        painter.setClipRect(text_rect)
+        alignment = {'left': Qt.AlignmentFlag.AlignLeft,
+                     'center': Qt.AlignmentFlag.AlignHCenter,
+                     'right': Qt.AlignmentFlag.AlignRight}.get(
+                         self.mark.get('alignment', 'left'), Qt.AlignmentFlag.AlignLeft)
+        painter.drawText(text_rect, int(alignment) | int(Qt.AlignmentFlag.AlignTop) |
+                         int(Qt.TextFlag.TextWordWrap), self.mark['text'])
+        painter.restore()
+
+
 class ImageCanvas(QGraphicsView):
     """Zoomable middle-column canvas for a single document page.
 
@@ -1214,6 +1456,7 @@ class ImageCanvas(QGraphicsView):
     the higher-level ProjectPane decides which project/page is active.
     """
     filesDropped = Signal(list)
+    stickyPlaceRequested = Signal(float, float)
     highlightCreated = Signal(dict)
     strokeCreated = Signal(dict)
     strokeMoved = Signal(int, dict)
@@ -1222,6 +1465,7 @@ class ImageCanvas(QGraphicsView):
     shapeCreated = Signal(dict)
     strokeResized = Signal(int, dict)
     annotationSelected = Signal(int, object)  # index, saved mark; -1 when deselected
+    stickyDoubleClicked = Signal(str)  # stable mark ID for the composer
     editingGesture = Signal(bool)  # hide one floating editor while moving/resizing
     zoomChanged = Signal(float, bool)  # actual displayed scale, Fit state
     ocrRegionsChanged = Signal(int)
@@ -1242,6 +1486,23 @@ class ImageCanvas(QGraphicsView):
                             QPainter.RenderHint.SmoothPixmapTransform |
                             QPainter.RenderHint.TextAntialiasing)
         self.canvas_scene.addItem(self.image_item)
+        # One bookmark badge per viewport, never one bitmap per page.
+        ribbon = QPainterPath(QPointF(0, 0))
+        ribbon.lineTo(13, 0)
+        ribbon.lineTo(13, 18)
+        ribbon.lineTo(6.5, 13)
+        ribbon.lineTo(0, 18)
+        ribbon.closeSubpath()
+        self.bookmark_ribbon = QGraphicsPathItem(ribbon)
+        self.bookmark_ribbon.setZValue(98)
+        self.bookmark_ribbon.setBrush(QBrush(QColor('#ce6384')))
+        self.bookmark_ribbon.setPen(QPen(QColor('#ffffff'), 1.5))
+        self.bookmark_ribbon.setFlag(
+            QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.bookmark_ribbon.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.bookmark_ribbon.setToolTip('Bookmarked page')
+        self.bookmark_ribbon.hide()
+        self.canvas_scene.addItem(self.bookmark_ribbon)
         # This overlay is a transient, viewport-sized bicubic enlargement.
         # We never render a bigger PDF, write another cache file, or retain a
         # second full-page bitmap. Its maximum output is 2.25 megapixels.
@@ -1265,6 +1526,7 @@ class ImageCanvas(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self._fit = True
+        self._extra_vertical_scroll = False
         self.setAcceptDrops(True)
         self.highlight_mode = False
         self.highlight_color = '#FFE536'
@@ -1540,7 +1802,7 @@ class ImageCanvas(QGraphicsView):
     def set_annotation_tool(self, tool: str):
         self._cancel_eraser_drag()
         self.clear_text_selection()
-        if tool not in ('pan', 'ocr', 'text_select', 'highlight', 'highlight_area', 'highlight_line', 'pen', 'marker', 'select', 'eraser',
+        if tool not in ('sticky_place', 'pan', 'ocr', 'text_select', 'highlight', 'highlight_area', 'highlight_line', 'pen', 'marker', 'select', 'eraser',
                         'line', 'arrow', 'rectangle', 'ellipse'):
             raise ValueError('Unsupported annotation tool')
         if self._live_stroke is not None and self._live_stroke in self._marks:
@@ -1614,6 +1876,10 @@ class ImageCanvas(QGraphicsView):
                 self._draw_stroke(mark, index)
             elif mark.get('kind') == 'shape':
                 self._draw_shape(mark, index)
+            elif mark.get('kind') == 'photo':
+                self._draw_photo(mark, index)
+            elif mark.get('kind') == 'sticky':
+                self._draw_sticky(mark, index)
         if old_mark is not None and self.annotation_tool == 'select':
             for item, mark in self._item_marks.items():
                 if ((old_mark.get('id') and mark.get('id') == old_mark['id']) or
@@ -1646,6 +1912,11 @@ class ImageCanvas(QGraphicsView):
 
     def _shape_path(self, mark):
         bounds = self._page_bounds()
+        if mark['kind'] in ('photo', 'sticky'):
+            path = QPainterPath()
+            path.addRect(QRectF(mark['x']*bounds.width(), mark['y']*bounds.height(),
+                                mark['w']*bounds.width(), mark['h']*bounds.height()))
+            return path
         if mark['kind'] == 'highlight':
             path = QPainterPath()
             if mark.get('segments'):
@@ -1763,6 +2034,14 @@ class ImageCanvas(QGraphicsView):
         self._apply_item_appearance(item, mark)
         return self._register_vector_item(item, mark, index)
 
+    def _draw_photo(self, mark, index):
+        item = PhotoAnnotationItem(mark, self._shape_path(mark))
+        return self._register_vector_item(item, mark, index, z=5)
+
+    def _draw_sticky(self, mark, index):
+        item = StickyAnnotationItem(mark, self._shape_path(mark))
+        return self._register_vector_item(item, mark, index, z=6)
+
     def _draw_highlight(self, mark, index):
         """Both page-highlighter modes multiply against the visible page."""
         item = MultiplyStrokeItem(self._shape_path(mark))
@@ -1772,6 +2051,9 @@ class ImageCanvas(QGraphicsView):
     def preview_selected_appearance(self, mark):
         """Preview alpha/width in-place; no history or persistence until commit."""
         if self._selected_stroke in self._item_marks:
+            if mark.get('kind') in ('photo', 'sticky'):
+                self._selected_stroke.setOpacity(float(mark.get('opacity', 100))/100)
+                return
             if mark.get('shape') == 'arrow':
                 self._selected_stroke.setPath(self._shape_path(mark))
                 self._show_resize_handles()
@@ -1852,6 +2134,17 @@ class ImageCanvas(QGraphicsView):
                 return name
         return None
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            scene = self.mapToScene(event.position().toPoint())
+            item, _ = self._stroke_hit(scene)
+            mark = self._item_marks.get(item)
+            if mark and mark.get('kind') == 'sticky':
+                self.stickyDoubleClicked.emit(mark['id'])
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     def _stroke_hit(self, scene_point):
         for item in self.canvas_scene.items(scene_point):
             if item in self._stroke_items:
@@ -1861,6 +2154,41 @@ class ImageCanvas(QGraphicsView):
     def _page_bounds(self):
         # Always use stable scene coordinates, even for a 10% raster.
         return QRectF(0, 0, self._reference_size.width(), self._reference_size.height())
+
+    def _update_vertical_scroll_space(self):
+        """Only expand scene bounds; never move the page or its annotations."""
+        page = self._page_bounds()
+        if page.isEmpty() or not self._extra_vertical_scroll:
+            self.canvas_scene.setSceneRect(page)
+            return
+        scale = max(0.0001, abs(self.transform().m11()))
+        visible = max(1, self.viewport().height()) / scale
+        padding = extra_vertical_scene_padding(page.height(), visible)
+        self.canvas_scene.setSceneRect(QRectF(
+            page.left(), page.top() - padding,
+            page.width(), page.height() + padding * 2.0))
+
+    def set_extra_vertical_scroll(self, enabled, *, preserve=True):
+        """Offer real blank scroll room without changing preview or zoom data."""
+        enabled = bool(enabled)
+        if self._extra_vertical_scroll == enabled:
+            return
+        centre = (self.mapToScene(self.viewport().rect().center())
+                  if preserve and not self._page_bounds().isEmpty() else None)
+        self._extra_vertical_scroll = enabled
+        self._update_vertical_scroll_space()
+        if centre is not None:
+            self.centerOn(centre)
+
+    def centre_page_vertically(self):
+        """One-click optical centring, without changing zoom or PDF bytes."""
+        page = self._page_bounds()
+        if page.isEmpty():
+            return
+        self.set_extra_vertical_scroll(True)
+        current_x = self.mapToScene(self.viewport().rect().center()).x()
+        self.centerOn(QPointF(current_x, page.center().y()))
+        self._schedule_bicubic()
 
     def _mark_rect(self, rect, color, opacity=35):
         item = MultiplyHighlightItem(rect)
@@ -2143,6 +2471,11 @@ class ImageCanvas(QGraphicsView):
             if bounds.isEmpty():
                 event.accept()
                 return
+            if self.annotation_tool == 'sticky_place':
+                self.stickyPlaceRequested.emit(point.x()/bounds.width(),
+                                              point.y()/bounds.height())
+                event.accept()
+                return
             if self._start_text_drag(event.position().toPoint()):
                 event.accept()
                 return
@@ -2313,6 +2646,8 @@ class ImageCanvas(QGraphicsView):
             item.setPath(self._shape_path(proposal) if proposal['kind'] != 'stroke'
                          else self._stroke_path(proposal['points']))
             self._item_marks[item] = proposal
+            if hasattr(item, 'mark'):
+                item.mark = dict(proposal)
             self._show_resize_handles()
             event.accept()
             return
@@ -2418,6 +2753,8 @@ class ImageCanvas(QGraphicsView):
                 self._selected_stroke.setPath(self._shape_path(old) if old['kind'] != 'stroke'
                                               else self._stroke_path(old['points']))
                 self._item_marks[self._selected_stroke] = old
+                if hasattr(self._selected_stroke, 'mark'):
+                    self._selected_stroke.mark = dict(old)
                 self._show_resize_handles()
             self.editingGesture.emit(False)
             event.accept()
@@ -2567,11 +2904,28 @@ class ImageCanvas(QGraphicsView):
         self.image_item.setPixmap(pixmap)
         self.image_item.setScale(factor)
         self._sync_page_sampling()
-        self.canvas_scene.setSceneRect(self._page_bounds())
+        self._update_vertical_scroll_space()
+        self._place_bookmark_ribbon()
         self._refresh_ocr_overlay()
         self._schedule_bicubic()
         self.viewport().update()
         return True
+
+    def set_page_bookmarked(self, bookmarked, label=''):
+        """Update bookmark ribbon without rebuilding the scene or the PDF."""
+        self._page_bookmarked = bool(bookmarked)
+        self.bookmark_ribbon.setToolTip('🔖 ' + str(label) if label else 'Bookmarked page')
+        self._place_bookmark_ribbon()
+
+    def _place_bookmark_ribbon(self):
+        rect = self._page_bounds()
+        visible = bool(getattr(self, '_page_bookmarked', False) and
+                       not self.image_item.pixmap().isNull() and not rect.isEmpty())
+        if visible:
+            # Keep the *size* screen-constant, but the icon attached to the
+            # page's top-right corner across zooming and scrolling.
+            self.bookmark_ribbon.setPos(rect.right()-18, rect.top()+8)
+        self.bookmark_ribbon.setVisible(visible)
 
     def show_image(self, path: Path | None):
         self.clear_ocr_regions()
@@ -2591,7 +2945,8 @@ class ImageCanvas(QGraphicsView):
         self.image_item.setScale(1.0)
         self.image_item.setPixmap(pixmap)
         self._reference_size = pixmap.size()
-        self.canvas_scene.setSceneRect(self._page_bounds())
+        self._update_vertical_scroll_space()
+        self._place_bookmark_ribbon()
         self._refresh_ocr_overlay()
         self.fit_page()
         return not pixmap.isNull()
@@ -2605,11 +2960,16 @@ class ImageCanvas(QGraphicsView):
             return None
         top_left = self.mapToScene(QPoint(0, 0))
         x = max(0.0, min(1.0, (top_left.x() - rect.left()) / rect.width()))
-        y = max(0.0, min(1.0, (top_left.y() - rect.top()) / rect.height()))
+        raw_y = (top_left.y() - rect.top()) / rect.height()
+        y = max(0.0, min(1.0, raw_y))
         vertical = self.verticalScrollBar()
-        return {'x': round(x, 7), 'y': round(y, 7),
-                'bottom': (vertical.maximum() > 0 and
-                           vertical.value() >= vertical.maximum() - 2)}
+        position = {'x': round(x, 7), 'y': round(y, 7),
+                    'bottom': (not self._extra_vertical_scroll and
+                        vertical.maximum() > 0 and
+                        vertical.value() >= vertical.maximum() - 2)}
+        if self._extra_vertical_scroll and (raw_y < 0 or raw_y > 1):
+            position['overscroll_y'] = round(max(-8., min(8., raw_y)), 7)
+        return position
 
     def apply_reading_zoom(self, saved):
         """Apply Fit or absolute view scale; never render an extra PDF bitmap."""
@@ -2625,21 +2985,23 @@ class ImageCanvas(QGraphicsView):
         self._fit = False
         self.resetTransform()
         self.scale(level, level)
+        self._update_vertical_scroll_space()
         self._emit_zoom()
 
     def restore_reading_position(self, saved=None, *, start_at_top=True):
         """Reposition using page-relative coordinates across window sizes/DPI.
 
         An unvisited page begins at its top edge, with horizontal centring.
-        Previously visited pages use their own scroll memory, never a group
-        scroll position. If the viewport is taller than the image, alignment
-        rules are used rather than inventing empty scroll range.
+        Previously visited pages use their own scroll memory. Extra
+        scrolling, when enabled, permits centring short slides; otherwise
+        the historic top-edge behaviour remains exactly as before.
         """
         if self.image_item.pixmap().isNull():
             return
         rect = self._page_bounds()
         if rect.isEmpty():
             return
+        self._update_vertical_scroll_space()
         scale = max(0.0001, abs(self.transform().m11()))
         visible_w = max(1, self.viewport().width()) / scale
         visible_h = max(1, self.viewport().height()) / scale
@@ -2650,11 +3012,21 @@ class ImageCanvas(QGraphicsView):
             y = max(0.0, min(1.0, float(saved.get('y', 0.0)))) * rect.height()
             if saved.get('bottom'):
                 y = range_y
+            if self._extra_vertical_scroll and 'overscroll_y' in saved:
+                raw = saved['overscroll_y']
+                if isinstance(raw, (float, int)) and math.isfinite(raw):
+                    y = max(-8., min(8., float(raw))) * rect.height()
         else:
             x = range_x * .5  # centre columns on an unvisited zoomed page
             y = 0.0 if start_at_top else range_y * .5
         x = min(range_x, max(0.0, x))
-        y = min(range_y, max(0.0, y))
+        if self._extra_vertical_scroll:
+            bounds = self.canvas_scene.sceneRect()
+            lower = bounds.top() - rect.top()
+            upper = max(lower, bounds.bottom() - rect.top() - visible_h)
+            y = min(upper, max(lower, y))
+        else:
+            y = min(range_y, max(0.0, y))
         self.centerOn(QPointF(rect.left() + x + visible_w * .5,
                               rect.top() + y + visible_h * .5))
         self._schedule_bicubic()
@@ -2665,6 +3037,7 @@ class ImageCanvas(QGraphicsView):
         self._zoom_factor = 1.0
         if not self.image_item.pixmap().isNull():
             self.fitInView(self._page_bounds(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._update_vertical_scroll_space()
         self._emit_zoom()
 
     def zoom(self, multiplier: float, anchor_pos=None):
@@ -2685,6 +3058,7 @@ class ImageCanvas(QGraphicsView):
         self._fit = False
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.scale(multiplier, multiplier)
+        self._update_vertical_scroll_space()
         after = self.mapToScene(point)
         centre = self.mapToScene(self.viewport().rect().center())
         self.centerOn(centre + (before - after))
@@ -2700,12 +3074,15 @@ class ImageCanvas(QGraphicsView):
     def actual_pixels(self):
         self._fit = False
         self.resetTransform()
+        self._update_vertical_scroll_space()
         self._emit_zoom()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._fit:
             self.fit_page()
+        else:
+            self._update_vertical_scroll_space()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -2900,9 +3277,18 @@ class ProjectPane(QWidget):
         self.add_page_menu.addAction(
             'Smart Import…', lambda: self.choose_files(
                 self._selected_insertion_index(), smart_default=True))
+        self.add_page_menu.addAction('Paste Clipboard Image as Page', self.paste_clipboard_page)
         self.add_page_menu.addAction('Add Blank Page', self.add_blank)
         self.import_button.setMenu(self.add_page_menu)
         actions.addWidget(self.import_button)
+        self.bookmark_button = QToolButton()
+        self.bookmark_button.setText('🔖 Bookmarks')
+        self.bookmark_button.setToolTip('Jump to saved pages or bookmark the selected page')
+        self.bookmark_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.bookmark_menu = QMenu(self.bookmark_button)
+        self.bookmark_menu.aboutToShow.connect(self._populate_bookmark_menu)
+        self.bookmark_button.setMenu(self.bookmark_menu)
+        actions.addWidget(self.bookmark_button)
         # Kept as a compatibility alias; there is only one user-visible + menu.
         self.blank_button = QToolButton(self)
         self.blank_button.hide()
@@ -2926,6 +3312,10 @@ class ProjectPane(QWidget):
         self.nav_menu.addAction(
             'Smart Import…', lambda: self.choose_files(smart_default=True))
         self.nav_menu.addAction('Add blank page', self.add_blank)
+        self.nav_menu.addAction('Paste Clipboard Image as Page', self.paste_clipboard_page)
+        self.nav_menu.addAction('Paste Clipboard Image as Photo', self.paste_clipboard_photo)
+        self.nav_menu.addAction('Add Sticky Note…', self.add_sticky_note)
+        self.nav_menu.addAction('Bookmark selected page…', lambda: self.add_page_bookmark())
         self.nav_menu.addAction('Create page group…',
                                 lambda: self.create_page_group(root=True))
         self.nav_menu.addSeparator()
@@ -3191,7 +3581,17 @@ class ProjectPane(QWidget):
         self.canvas.strokesEraseGestureRequested.connect(self.erase_strokes)
         self.canvas.shapeCreated.connect(self.add_shape)
         self.canvas.strokeResized.connect(self.resize_stroke)
+        self._clipboard_page_shortcuts = []
+        for widget, callback in ((self.pages_list, self.paste_clipboard_page),
+                                 (self.group_tree, self.paste_clipboard_page),
+                                 (self.canvas, self.paste_clipboard_photo)):
+            shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Paste), widget)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(callback)
+            self._clipboard_page_shortcuts.append(shortcut)
         self.canvas.annotationSelected.connect(self._annotation_selection_changed)
+        self.canvas.stickyDoubleClicked.connect(self.edit_sticky_note)
+        self.canvas.stickyPlaceRequested.connect(self._place_sticky_note)
         self.preview_shortcuts = []
         for keys, callback in [('Alt+PgUp', lambda: self.move_selection(-1)),
                                ('Alt+PgDown', lambda: self.move_selection(1)),
@@ -3386,6 +3786,19 @@ class ProjectPane(QWidget):
         self._annotation_footer_buttons.append(self.highlight_button)
         self._annotation_group_buttons['highlight'] = self.highlight_button
 
+        photo_button = mini_tool('Photo', 'Paste clipboard image as a movable photo on this page · Ctrl+V',
+                                 self.paste_clipboard_photo)
+        photo_button.setIcon(line_icon('image'))
+        photo_button.setProperty('annotationIconName', 'image')
+        photo_button.setIconSize(QSize(17, 17))
+        self._annotation_photo_button = photo_button
+        sticky_button = mini_tool('Sticky', 'Add a coloured paper note · double-click to edit',
+                                  self.add_sticky_note)
+        sticky_button.setIcon(line_icon('sticky-note'))
+        sticky_button.setProperty('annotationIconName', 'sticky-note')
+        sticky_button.setIconSize(QSize(17, 17))
+        self._annotation_sticky_button = sticky_button
+
         eraser = mini_tool('Erase', 'Hold and drag to erase touched annotations; one Undo restores the stroke',
                            lambda: self.set_annotation_mode('eraser'))
         eraser.setIcon(line_icon('eraser'))
@@ -3420,6 +3833,10 @@ class ProjectPane(QWidget):
         self._annotation_overflow.setToolTip('More annotation tools')
         self._annotation_overflow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         overflow_menu = QMenu(self._annotation_overflow)
+        overflow_menu.addAction('Paste Photo from Clipboard', self.paste_clipboard_photo)
+        overflow_menu.addAction('Add Sticky Note…', self.add_sticky_note)
+        overflow_menu.addAction('Edit Selected Sticky…', lambda: self.edit_sticky_note())
+        overflow_menu.addSeparator()
         overflow_menu.addAction('Erase', lambda: self.set_annotation_mode('eraser'))
         overflow_menu.addAction('Clear', self.clear_highlights)
         overflow_menu.addAction('Colour', self.show_annotation_appearance)
@@ -3431,7 +3848,7 @@ class ProjectPane(QWidget):
         self._annotation_label_text = {self._annotation_overflow: '',
             select_button: 'Select', pan_button: '',
             drawing_button: 'Draw', self.highlight_button: 'Highlight',
-            eraser: 'Erase', clear_button: 'Clear',
+            photo_button: 'Photo', sticky_button: 'Sticky', eraser: 'Erase', clear_button: 'Clear',
             self.appearance_button: 'Colour', link_button: 'Link'}
         # Contextual pen width: does not touch existing selected marks or the
         # Quick Edit panel. One compact control, visible only in freehand Pen.
@@ -4181,6 +4598,95 @@ class ProjectPane(QWidget):
                 self.pages_list.item(row).setData(Qt.ItemDataRole.DecorationRole,
                                                   self._thumbnail_decoration(QPixmap.fromImage(decoded)))
 
+    def _apply_page_bookmark(self, page_id, label):
+        page = self.project.page_by_id(page_id)
+        if not page:
+            return
+        if label:
+            page['bookmark'] = label
+        else:
+            page.pop('bookmark', None)
+        for i, record in enumerate(self.project.pages):
+            if record['id'] == page_id and i < self.pages_list.count():
+                self.pages_list.item(i).setToolTip(
+                    ('🔖 ' if label else '') + record['title'] +
+                    (f' · {label}' if label else ''))
+                self.pages_list.item(i).setData(Qt.ItemDataRole.UserRole + 1, bool(label))
+                break
+        # Update the matching group row in-place: no tree rebuild or PDF work.
+        if hasattr(self, 'group_tree'):
+            self.group_tree.update_page_bookmark(page_id, label)
+        active = self.current_page()
+        if active is not None and active['id'] == page_id:
+            self.canvas.set_page_bookmarked(bool(label), label)
+        self.schedule_save()
+
+    def add_page_bookmark(self, page_id=None):
+        page = self.project.page_by_id(page_id) if page_id else self.current_page()
+        if not page:
+            self.statusMessage.emit('Select a page to bookmark.')
+            return
+        before = page.get('bookmark')
+        label, ok = QInputDialog.getText(
+            self, 'Bookmark Page', 'Bookmark label (up to 120 characters):',
+            text=before or page['title'][:120])
+        if not ok:
+            return
+        after = label.strip()
+        if not after or len(after) > 120:
+            QMessageBox.warning(self, 'Bookmark label', 'Use 1–120 characters.')
+            return
+        if before == after:
+            return
+        pid = page['id']
+        self._separate_text_commands()
+        self.history.perform(CallbackAction('Bookmark Page',
+            lambda: self._apply_page_bookmark(pid, before),
+            lambda: self._apply_page_bookmark(pid, after)))
+
+    def remove_page_bookmark(self, page_id):
+        page = self.project.page_by_id(page_id)
+        if not page or not page.get('bookmark'):
+            return
+        before = page['bookmark']
+        self._separate_text_commands()
+        self.history.perform(CallbackAction('Remove Bookmark',
+            lambda: self._apply_page_bookmark(page_id, before),
+            lambda: self._apply_page_bookmark(page_id, None)))
+
+    def _bookmark_page_menu(self, menu, page_id):
+        page = self.project.page_by_id(page_id)
+        if not page:
+            return
+        if page.get('bookmark'):
+            menu.addAction('🔖 Rename bookmark…',
+                           lambda _=False, pid=page_id: self.add_page_bookmark(pid))
+            menu.addAction('Remove bookmark',
+                           lambda _=False, pid=page_id: self.remove_page_bookmark(pid))
+        else:
+            menu.addAction('🔖 Bookmark this page…',
+                           lambda _=False, pid=page_id: self.add_page_bookmark(pid))
+
+    def _populate_bookmark_menu(self):
+        menu = self.bookmark_menu
+        menu.clear()
+        current = self.current_page()
+        if current:
+            menu.addAction('Bookmark current page…', lambda: self.add_page_bookmark())
+            menu.addSeparator()
+        entries = [(i, p) for i, p in enumerate(self.project.pages)
+                   if p.get('bookmark')]
+        if not entries:
+            empty = menu.addAction('No bookmarks yet')
+            empty.setEnabled(False)
+            return
+        for index, page in entries[:500]:
+            action = menu.addAction(f'{index+1}. {page["bookmark"]}',
+                lambda _=False, pid=page['id']: self.select_page_id(pid))
+            action.setToolTip(page['title'])
+        if len(entries) > 500:
+            menu.addAction(f'{len(entries)-500} further bookmarks not shown').setEnabled(False)
+
     def current_page(self) -> dict | None:
         item = self.pages_list.currentItem()
         return self.project.page_by_id(item.data(Qt.ItemDataRole.UserRole)) if item else None
@@ -4200,10 +4706,12 @@ class ProjectPane(QWidget):
         for page in self.project.pages:
             item = QListWidgetItem(page['title'])
             item.setData(Qt.ItemDataRole.UserRole, page['id'])
+            item.setData(Qt.ItemDataRole.UserRole + 1, bool(page.get('bookmark')))
             item.setSizeHint(QSize(155, 82 if self._nav_mode == 'mini' else 112 if self._nav_mode == 'compact' else self.pages_list.ROW_HEIGHT))
             # Titles remain in DisplayRole for old projects, renaming and
             # accessibility; the delegate hides them visually until hover.
-            item.setToolTip(page['title'])
+            item.setToolTip(('🔖 ' if page.get('bookmark') else '') +
+                            page['title'] + (f' · {page["bookmark"]}' if page.get('bookmark') else ''))
             item.setData(Qt.ItemDataRole.AccessibleTextRole, page['title'])
             self.pages_list.addItem(item)
         count = len(self.project.pages)
@@ -4737,6 +5245,14 @@ class ProjectPane(QWidget):
         menu.addAction('Group selected pages…', self.group_selected_pages)
         if group_id:
             menu.addSeparator()
+            extra_scroll = menu.addAction('Allow extra page scrolling in this group')
+            extra_scroll.setCheckable(True)
+            extra_scroll.setChecked(group_extra_vertical_scroll(
+                self.project.page_groups, group_id))
+            extra_scroll.triggered.connect(
+                lambda value, gid=group_id: self.set_group_extra_scroll(gid, value))
+            menu.addAction('Centre current page vertically', self.centre_current_page)
+            menu.addSeparator()
             menu.addAction('Add subgroup…',
                            lambda gid=group_id: self.create_page_group(gid))
             menu.addAction('Rename group…',
@@ -4746,6 +5262,7 @@ class ProjectPane(QWidget):
             menu.addAction('Delete group AND pages…',
                            lambda gid=group_id: self.delete_page_group(gid))
         if item is not None and item.data(0, ROLE_KIND) == 'page':
+            self._bookmark_page_menu(menu, item.data(0, ROLE_ID))
             self._reading_page_menu(menu, item.data(0, ROLE_ID))
         if group_id:
             selected_groups = [i.data(0, ROLE_ID) for i in
@@ -4837,6 +5354,8 @@ class ProjectPane(QWidget):
             return
         page = self.current_page()
         self.project.selected_page = page['id'] if page else None
+        self.canvas.set_page_bookmarked(bool(page and page.get('bookmark')),
+                                         page.get('bookmark', '') if page else '')
         if page:
             self.page_title.setText(page['title'])
             self.page_title._has_page = True
@@ -4891,6 +5410,8 @@ class ProjectPane(QWidget):
                     self._clarity_token += 1
                     self._clarity_applied_signature = None
                     self.canvas.set_annotations(self.project.annotations.get(page['id'], []))
+                    self.canvas.set_page_bookmarked(bool(page.get('bookmark')),
+                                                    page.get('bookmark', ''))
                     self._load_native_text_for_page(page, token)
                     self._view_displayed_page_id = page['id']
                     self._sync_text_select_availability()
@@ -4945,6 +5466,30 @@ class ProjectPane(QWidget):
                 start_task(self, worker, lambda *_: None, priority=-3)
 
     # --- Reading View Memory: per-page scroll, inherited root-group zoom ---
+    def _extra_scroll_for_page(self, page_id=None):
+        page_id = page_id or self._view_displayed_page_id
+        return (self._reading_flag('readingExtraScroll', False) or
+            bool(page_id and page_extra_vertical_scroll(
+                self.project.page_groups, page_id)))
+
+    def refresh_extra_scroll_mode(self):
+        """Apply settings without reloading or re-decoding the current page."""
+        self.canvas.set_extra_vertical_scroll(self._extra_scroll_for_page())
+
+    def centre_current_page(self):
+        """Even short landscape slides can be optically centred on demand."""
+        self.canvas.centre_page_vertically()
+        self._reading_scroll_moved()
+
+    def set_group_extra_scroll(self, group_id, enabled):
+        try:
+            tree = set_group_extra_vertical_scroll(
+                self.project.page_groups, group_id, enabled)
+            self._commit_group_edit(tree,
+                'Enable Page Centring' if enabled else 'Disable Page Centring')
+        except ValueError as exc:
+            QMessageBox.warning(self, 'Page centring', str(exc))
+
     def _reading_flag(self, key, default=True):
         value = self.settings.value(key, 'true' if default else 'false')
         return str(value).lower() in ('true', '1', 'yes')
@@ -5007,6 +5552,8 @@ class ProjectPane(QWidget):
         self._view_restoring = True
         try:
             view = self._reading_data()
+            self.canvas.set_extra_vertical_scroll(
+                self._extra_scroll_for_page(pid), preserve=False)
             zoom = effective_zoom(view, self.project.page_groups, pid,
                                   self._reading_flag('readingViewSharedZoom'))
             self.canvas.apply_reading_zoom(zoom)
@@ -5424,12 +5971,12 @@ class ProjectPane(QWidget):
         # A notebook is never a document/page import. In particular, a drop
         # over a previewed page must not anchor a whole-tab exchange there.
         notebook_paths = [p for p in paths if Path(p).suffix.lower() in
-                          ('.yomunote', '.yominote')]
+                          ('.pinbunote', '.yomunote', '.yominote')]
         if notebook_paths:
             if len(paths) == 1 and len(notebook_paths) == 1:
                 self.notebookDropped.emit(notebook_paths[0])
             else:
-                self.statusMessage.emit('Drop one .yomunote notebook at a time; '
+                self.statusMessage.emit('Drop one notebook file at a time; '
                                         'do not mix notebook files and documents.')
             return
         if self._importing:
@@ -5764,6 +6311,7 @@ class ProjectPane(QWidget):
                 self._toggle_read_status('page', pid, value))
             menu.addSeparator()
         if item is not None:
+            self._bookmark_page_menu(menu, clicked_id)
             self._reading_page_menu(menu, clicked_id)
         link = menu.addAction(f'↗ Link page in notes  ·  {docs_shortcut("page_link")}')
         link.setEnabled(self.current_page() is not None)
@@ -5783,6 +6331,7 @@ class ProjectPane(QWidget):
         menu.addAction(f'Select all pages  ·  {PRIMARY}A', self.pages_list.selectAll)
         menu.addAction('Import File after selection…', lambda: self.choose_files(self._selected_insertion_index()))
         menu.addAction('Add Blank Page after selection', self.add_blank)
+        menu.addAction('Paste Clipboard Image as Page', self.paste_clipboard_page)
         menu.exec(self.pages_list.mapToGlobal(position))
 
     def remove_page_ids_confirmed(self, ids):
@@ -6240,7 +6789,7 @@ class ProjectPane(QWidget):
             return
         if not find_tesseract():
             QMessageBox.warning(self, 'Tesseract required',
-                'The offline OCR engine could not be found. If you installed Yomu Note, please reinstall it.\n'
+                'The offline OCR engine could not be found. If you installed Pinbu Note, please reinstall it.\n'
                 'If running from Python source, install Tesseract on this computer.')
             return
         page_snapshot = dict(page)
@@ -6374,6 +6923,8 @@ class ProjectPane(QWidget):
             available and self.canvas.annotation_tool == 'text_select')
 
     def set_annotation_mode(self, tool):
+        if tool != 'sticky_place':
+            self._pending_sticky = None
         if tool == 'text_select' and not self._text_select_action.isEnabled():
             return
         if tool == 'highlight' and not self._text_select_action.isEnabled():
@@ -6401,6 +6952,7 @@ class ProjectPane(QWidget):
             'arrow': 'Arrow: drag to draw · Shift snaps to 45°.',
             'rectangle': 'Rectangle: drag to draw · Shift makes a square.',
             'ellipse': 'Ellipse: drag to draw · Shift makes a circle.',
+            'sticky_place': 'Sticky note: click the page to place your note; choose another tool to cancel.',
             'select': 'Select: click a mark to edit colour/opacity/thickness; drag or resize.',
             'text_select': 'Select Text: drag over PDF text, then Ctrl+C / Cmd+C to copy.',
             'eraser': 'Eraser: hold the left mouse button and sweep across annotations; one Undo restores the gesture.',
@@ -6478,8 +7030,8 @@ class ProjectPane(QWidget):
         is_highlight = kind in ('highlight', 'highlight_line')
         supports_fill = ((kind == 'shape' and mark.get('shape') in ('rectangle', 'ellipse'))
                          if mark is not None else tool in ('rectangle', 'ellipse'))
-        has_width = kind != 'highlight'
-        has_stroke = not is_highlight and kind not in ('pan', 'select', 'eraser')
+        has_width = kind not in ('highlight', 'photo', 'sticky')
+        has_stroke = not is_highlight and kind not in ('photo', 'sticky', 'pan', 'select', 'eraser')
         self._syncing_appearance = True
         try:
             self.pen_colour.set_colour(style.get('color', '#d74685'))
@@ -6497,7 +7049,7 @@ class ProjectPane(QWidget):
             self.swap_colours_button.setVisible(supports_fill)
             self._opacity_rows['fill'].setVisible(supports_fill)
             self._opacity_labels['stroke'].setText(
-                'Highlight opacity' if is_highlight else 'Stroke opacity')
+                'Highlight opacity' if is_highlight else 'Paper opacity' if kind == 'sticky' else 'Photo opacity' if kind == 'photo' else 'Stroke opacity')
             self.stroke_colour_label.setText('Highlight' if is_highlight else 'Stroke')
             self.fill_colour.setEnabled(supports_fill)
             self.fill_opacity_control.setEnabled(supports_fill)
@@ -6510,9 +7062,9 @@ class ProjectPane(QWidget):
                 for key, slider in self.arrow_head_sliders.items():
                     with QSignalBlocker(slider):
                         slider.setValue(round(1000*style.get(key, .018 if key == 'head_width' else .025)))
-            self.quick_palette.setEnabled(mark is not None or tool not in ('pan', 'select', 'eraser'))
+            self.quick_palette.setEnabled(kind != 'photo' and (mark is not None or tool not in ('pan', 'select', 'eraser')))
             self.stroke_opacity_control.setEnabled(kind not in ('pan', 'select', 'eraser'))
-            self.pen_colour.setEnabled(kind not in ('pan', 'select', 'eraser'))
+            self.pen_colour.setEnabled(kind not in ('photo', 'pan', 'select', 'eraser'))
             self.pen_colour.set_paint_enabled(not
                 (kind == 'shape' and not self.stroke_enabled_checkbox.isChecked()))
             self.fill_colour.set_paint_enabled(self.shape_fill_checkbox.isChecked())
@@ -6564,6 +7116,22 @@ class ProjectPane(QWidget):
         title_row.addWidget(close_button)
         layout.addLayout(title_row)
         layout.addWidget(self.appearance_panel)
+        self.quick_sticky_font_row = QWidget(panel)
+        sticky_font_layout = QHBoxLayout(self.quick_sticky_font_row)
+        sticky_font_layout.setContentsMargins(1, 2, 1, 2)
+        sticky_font_layout.addWidget(QLabel('Sticky font size'))
+        self.quick_sticky_font_size = QSpinBox(self.quick_sticky_font_row)
+        self.quick_sticky_font_size.setObjectName('quickStickyFontSize')
+        self.quick_sticky_font_size.setRange(6, 72)
+        self.quick_sticky_font_size.setSuffix(' pt')
+        self.quick_sticky_font_size.setToolTip(
+            'Change selected sticky-note font size; one Undo step per edit')
+        self.quick_sticky_font_size.editingFinished.connect(
+            self._commit_quick_sticky_font_size)
+        sticky_font_layout.addWidget(self.quick_sticky_font_size)
+        sticky_font_layout.addStretch(1)
+        layout.addWidget(self.quick_sticky_font_row)
+        self.quick_sticky_font_row.hide()
         resize_row = QHBoxLayout()
         resize_row.setContentsMargins(0, 0, 0, 0)
         resize_row.addStretch(1)
@@ -6633,6 +7201,9 @@ class ProjectPane(QWidget):
         else:
             mode = 'small'
         hidden = set()
+        if available < 390:
+            hidden.add(self._annotation_photo_button)
+            hidden.add(self._annotation_sticky_button)
         if available < 310:
             hidden.update((self._annotation_clear_button, self.appearance_button,
                            self._annotation_link_button))
@@ -6730,11 +7301,13 @@ class ProjectPane(QWidget):
                 color: {colours['ink']}; border: none;}}
             QFrame#annotationQuickEdit QLabel {{color: {colours['ink']}; border: none;
                 background: transparent;}}
-            QFrame#annotationQuickEdit QDoubleSpinBox {{
+            QFrame#annotationQuickEdit QDoubleSpinBox,
+            QFrame#annotationQuickEdit QSpinBox {{
                 background: {colours['paper']}; color: {colours['ink']};
                 border: 1px solid {colours['border']}; border-radius: 5px;
                 padding: 2px 3px; selection-background-color: {colours['accent']};}}
-            QFrame#annotationQuickEdit QDoubleSpinBox QLineEdit {{
+            QFrame#annotationQuickEdit QDoubleSpinBox QLineEdit,
+            QFrame#annotationQuickEdit QSpinBox QLineEdit {{
                 color: {colours['ink']}; background: {colours['paper']};
                 selection-background-color: {colours['accent']};}}
             QFrame#annotationQuickEdit QSlider::groove:horizontal {{
@@ -6795,12 +7368,21 @@ class ProjectPane(QWidget):
             return
         kind = (mark.get('kind', '') if mark else self.canvas.annotation_tool)
         shape = mark.get('shape', '') if mark else ''
-        title = ('Highlight' if kind.startswith('highlight') else
+        title = ('Photo' if kind == 'photo' else
+                 'Highlight' if kind.startswith('highlight') else
                  shape.replace('_', ' ').title() if shape else
                  'Marker' if mark and mark.get('blend') == 'multiply' else
                  'Pen' if mark and kind == 'stroke' else 'Drawing defaults')
+        if kind == 'sticky':
+            title = 'Sticky Note'
         self.quick_title.setText(title + ' · Quick Edit')
-        self.quick_thickness_row.setVisible(kind != 'highlight')
+        is_sticky_selection = bool(mark is not None and kind == 'sticky')
+        self.quick_sticky_font_row.setVisible(is_sticky_selection)
+        if is_sticky_selection:
+            with QSignalBlocker(self.quick_sticky_font_size):
+                self.quick_sticky_font_size.setValue(round(mark['font_size']))
+        self.quick_thickness_row.setVisible(kind not in ('highlight', 'photo', 'sticky'))
+        self.stroke_paint_row.setVisible(kind != 'photo')
         self.arrow_size_row.setVisible(shape == 'arrow' or self.canvas.annotation_tool == 'arrow' and mark is None)
         with QSignalBlocker(self.quick_thickness):
             self.quick_thickness.setValue(round(self.stroke_width_control.value()*10))
@@ -6808,6 +7390,37 @@ class ProjectPane(QWidget):
         panel.layout().activate()
         panel.adjustSize()
         self._position_annotation_quick_edit()
+
+    def _commit_quick_sticky_font_size(self):
+        """Commit a sticky font change with the same page-local Undo as Edit Note."""
+        selected = self._appearance_selection_mark
+        page = self.current_page()
+        if (selected is None or selected.get('kind') != 'sticky'
+                or page is None):
+            return
+        mark_id = selected.get('id')
+        marks = self.project.annotations.get(page['id'], [])
+        old = next((mark for mark in marks if mark.get('id') == mark_id
+                    and mark.get('kind') == 'sticky'), None)
+        if old is None:
+            return
+        new_size = self.quick_sticky_font_size.value()
+        if old['font_size'] == new_size:
+            return
+        before, after = copy.deepcopy(old), copy.deepcopy(old)
+        after['font_size'] = new_size
+        if not valid_vector(after):
+            return
+        page_id = page['id']
+        def apply(replacement):
+            self._edit_stroke_marks(page_id, lambda items: [
+                copy.deepcopy(replacement) if mark.get('id') == mark_id else mark
+                for mark in items])
+            self.canvas.select_mark_by_id(mark_id)
+        self._separate_text_commands()
+        self.history.perform(CallbackAction(
+            'Change Sticky Font Size', lambda: apply(before),
+            lambda: apply(after), 256))
 
     def _position_annotation_quick_edit(self, *_):
         panel = getattr(self, 'annotation_quick_edit', None)
@@ -6928,7 +7541,8 @@ class ProjectPane(QWidget):
         if current is None:
             return None
         changed = dict(current)
-        changed['color'] = self.pen_colour.colour.name()
+        if changed['kind'] != 'photo':
+            changed['color'] = self.pen_colour.colour.name()
         changed['opacity'] = self.stroke_opacity_control.value()
         if changed['kind'] in ('stroke', 'shape', 'highlight_line'):
             changed['width'] = self.stroke_width_control.value()/1000
@@ -7002,7 +7616,8 @@ class ProjectPane(QWidget):
         self._separate_text_commands()
         self.history.perform(CallbackAction(
             'Change Annotation Appearance', lambda: apply(before),
-            lambda: apply(after), 256 + 90 * len(after.get('points', []))))
+            lambda: apply(after), 256 + 90 * len(after.get('points', []))
+            + len(after.get('data', ''))))
         self._displayed_appearance = values
 
     def _apply_palette_colour(self, color, target):
@@ -7144,6 +7759,150 @@ class ProjectPane(QWidget):
     def add_shape(self, mark):
         self._add_vector(mark, 'Draw Shape', auto_select=True)
 
+    def add_sticky_note(self):
+        """Compose, then choose the exact placement by clicking the page."""
+        if not self.current_page():
+            self.statusMessage.emit('Select a page before adding a sticky note.')
+            return
+        dialog = StickyNoteDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._pending_sticky = dialog.value()
+        self.set_annotation_mode('sticky_place')
+        self.statusMessage.emit('Click the preview where the sticky note should appear ♡')
+
+    def _place_sticky_note(self, x, y):
+        """Put the new note near the pointer and clamp to the page edges."""
+        if self.canvas.annotation_tool != 'sticky_place' or not self.current_page():
+            return
+        pending = getattr(self, '_pending_sticky', None)
+        if pending is None:
+            return
+        mark = copy.deepcopy(pending)
+        mark['x'] = min(1.0-mark['w'], max(0.0, float(x)-mark['w']/2))
+        mark['y'] = min(1.0-mark['h'], max(0.0, float(y)-mark['h']/2))
+        self._pending_sticky = None
+        self._add_vector(mark, 'Add Sticky Note', auto_select=True)
+        self.statusMessage.emit('Sticky placed ♡ Drag to move, resize with handles, or double-click to edit.')
+
+    def edit_sticky_note(self, mark_id=None):
+        """One whole-note history step for text, colour, font and appearance."""
+        page = self.current_page()
+        if not page:
+            return
+        marks = self.project.annotations.get(page['id'], [])
+        if mark_id is None:
+            current = getattr(self, '_appearance_selection_mark', None)
+            mark_id = current.get('id') if current and current.get('kind') == 'sticky' else None
+        old = next((m for m in marks if m.get('id') == mark_id and m.get('kind') == 'sticky'), None)
+        if old is None:
+            self.statusMessage.emit('Select or double-click a sticky note to edit it.')
+            return
+        dialog = StickyNoteDialog(old, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        before, after = copy.deepcopy(old), dialog.value()
+        if before == after:
+            return
+        page_id = page['id']
+        def apply(replacement):
+            def change(items):
+                return [copy.deepcopy(replacement) if m.get('id') == mark_id else m
+                        for m in items]
+            self._edit_stroke_marks(page_id, change)
+            self.canvas.select_mark_by_id(mark_id)
+        self._separate_text_commands()
+        self.history.perform(CallbackAction(
+            'Edit Sticky Note', lambda: apply(before), lambda: apply(after),
+            256 + len(before['text']) + len(after['text'])))
+
+    def paste_clipboard_photo(self):
+        """Paste compressed image ON the current preview as an editable object."""
+        page = self.current_page()
+        if page is None:
+            self.statusMessage.emit('Select a page first to paste a photo annotation.')
+            return
+        if sum(mark.get('kind') == 'photo' for mark in
+               self.project.annotations.get(page['id'], [])) >= 16:
+            QMessageBox.warning(self, 'Photo limit',
+                                'This page already has 16 photo annotations.')
+            return
+        try:
+            jpeg, width, height = _clipboard_jpeg(photo=True)
+            # Keep all photo objects well below the 32 MiB manifest-read cap.
+            embedded = sum(len(m.get('data', '')) for marks in
+                           self.project.annotations.values() for m in marks
+                           if m.get('kind') == 'photo')
+            if embedded + 4*((len(jpeg)+2)//3) > 12 * 1024 * 1024:
+                raise ValueError('This tab has reached its 12 MiB photo storage budget. '
+                                 'Paste the image as a separate page instead.')
+            bounds = self.canvas._page_bounds()
+            if bounds.isEmpty():
+                raise ValueError('Open a page preview before pasting a photo.')
+            rect_width = min(.60, .72 * width / max(1, height) *
+                             bounds.height() / max(1, bounds.width()))
+            rect_height = rect_width * height / width * bounds.width() / bounds.height()
+            # The image starts near the centre without exceeding the page.
+            rect = ((1-rect_width)/2, (1-rect_height)/2,
+                    rect_width, rect_height)
+            self._add_vector(make_photo(jpeg, rect), 'Paste Photo', auto_select=True)
+            self.statusMessage.emit('Photo pasted · drag to move, corners to resize · Undo supported.')
+        except (ValueError, RuntimeError) as exc:
+            QMessageBox.information(self, 'Paste photo', str(exc))
+
+    def paste_clipboard_page(self):
+        """Paste a compressed screenshot as a NEW regular, undoable page."""
+        if self._importing:
+            self.statusMessage.emit('Another import is already in progress.')
+            return
+        try:
+            jpeg, _width, _height = _clipboard_jpeg(photo=False)
+        except (ValueError, RuntimeError) as exc:
+            QMessageBox.information(self, 'Paste image page', str(exc))
+            return
+        position = self._selected_insertion_index()
+        target = self._chosen_group() if self._navigator_view == 'groups' else None
+        self._importing = True
+        self.import_button.setEnabled(False)
+        self.statusMessage.emit('Pasting clipboard image as a new page…')
+
+        def worker():
+            with tempfile.TemporaryDirectory(prefix='yomu-clipboard-') as directory:
+                temp = Path(directory)/'Clipboard image.jpg'
+                temp.write_bytes(jpeg)
+                return import_document(self.project, temp)[0]
+
+        def done(page, error):
+            self._importing = False
+            self.import_button.setEnabled(True)
+            if error:
+                QMessageBox.warning(self, 'Paste image page', str(error))
+                return
+            old_pages = list(self.project.pages)
+            old_tree = copy.deepcopy(self.project.page_groups)
+            old_selected = self.project.selected_page
+            try:
+                new_tree, _ = plan_import(
+                    old_tree, [p['id'] for p in old_pages],
+                    [('Clipboard image', [page['id']])],
+                    position=min(position, len(old_pages)), group_id=target,
+                    smart=False, strict_target=True)
+                lookup = {p['id']: p for p in [*old_pages, page]}
+                new_pages = [lookup[pid] for pid in flatten(new_tree)]
+            except (ValueError, KeyError, TypeError) as exc:
+                cleanup_uncommitted(self.project, [('Clipboard image', [page])])
+                QMessageBox.warning(self, 'Paste image page', str(exc))
+                return
+            self._separate_text_commands()
+            self.history.perform(CallbackAction(
+                'Paste Clipboard Page',
+                lambda: self._apply_group_snapshot(old_tree, old_pages, old_selected),
+                lambda: self._apply_group_snapshot(new_tree, new_pages, page['id']),
+                estimated_bytes=640))
+            self.statusMessage.emit('Clipboard image added as a new page. Undo supported.')
+
+        start_task(self, worker, done, priority=2)
+
     def _add_vector(self, mark, label, *, auto_select=False):
         page = self.current_page()
         if not page:
@@ -7168,7 +7927,7 @@ class ProjectPane(QWidget):
                                             lambda marks: remove_stroke(marks, stroke['id'])),
             lambda: self._edit_stroke_marks(page_id,
                                             lambda marks: add_mark(marks, stroke)),
-            256 + 50 * len(stroke.get('points', []))))
+            256 + 50 * len(stroke.get('points', [])) + len(stroke.get('data', ''))))
         if auto_select:
             self.set_annotation_mode('select')
             self.canvas.select_mark_by_id(stroke['id'])
@@ -7187,7 +7946,7 @@ class ProjectPane(QWidget):
             return
         page_id = page['id']
         marks = self.project.annotations.get(page_id, [])
-        if not 0 <= index < len(marks) or marks[index].get('kind') not in ('stroke', 'shape', 'highlight', 'highlight_line'):
+        if not 0 <= index < len(marks) or marks[index].get('kind') not in ('stroke', 'shape', 'highlight', 'highlight_line', 'photo', 'sticky'):
             return
         original = copy.deepcopy(marks[index])
         moved = translated_vector(original, delta['dx'], delta['dy'])
@@ -7210,7 +7969,7 @@ class ProjectPane(QWidget):
             return
         page_id = page['id']
         marks = self.project.annotations.get(page_id, [])
-        if not 0 <= index < len(marks) or marks[index].get('kind') not in ('stroke', 'shape', 'highlight', 'highlight_line'):
+        if not 0 <= index < len(marks) or marks[index].get('kind') not in ('stroke', 'shape', 'highlight', 'highlight_line', 'photo', 'sticky'):
             return
         original = copy.deepcopy(marks[index])
         if resized.get('id') != original.get('id') or resized == original:
@@ -7267,7 +8026,7 @@ class ProjectPane(QWidget):
             return
         page_id = page['id']
         marks = self.project.annotations.get(page_id, [])
-        if not 0 <= index < len(marks) or marks[index].get('kind') not in ('stroke', 'shape', 'highlight', 'highlight_line'):
+        if not 0 <= index < len(marks) or marks[index].get('kind') not in ('stroke', 'shape', 'highlight', 'highlight_line', 'photo', 'sticky'):
             return
         original = copy.deepcopy(marks[index])
         self._separate_text_commands()
@@ -7443,7 +8202,7 @@ class HoverDeleteTabBar(QTabBar):
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
         return (urls[0].toLocalFile() if len(urls) == 1 and urls[0].isLocalFile()
                 and Path(urls[0].toLocalFile()).suffix.lower() in
-                ('.yomunote', '.yominote') else None)
+                ('.pinbunote', '.yomunote', '.yominote') else None)
 
     def dragEnterEvent(self, event):
         if (event.mimeData().hasFormat(DropPageList.PAGE_MIME)
@@ -7580,15 +8339,15 @@ class MainWindow(QMainWindow):
     visible QTabWidget. They must stay in sync after import/Undo/Redo.
     Tab Exchange is staged off-thread and committed from the GUI thread.
     """
-    def __init__(self):
+    def __init__(self, initial_path=None):
         super().__init__()
-        self.setWindowTitle('Yomu Note  ·  よむ')
+        self.setWindowTitle('Pinbu Note  ·  ピンブノート')
         self.resize(1450, 900)
         self.setMinimumSize(760, 600)
-        self.settings = (QSettings('Yomu Note Integration Dev', 'Yomu Note Integration Dev')
+        self.settings = (QSettings('Pinbu Note Integration Dev', 'Pinbu Note Integration Dev')
                          if os.environ.get('YOMU_INTEGRATION_DEV') == '1'
-                         else QSettings('Yomu Note', 'Yomu Note'))
-        # One-time seed: keep normal Yomu Note preferences READ-ONLY;
+                         else QSettings('Pinbu Note', 'Pinbu Note'))
+        # One-time seed: keep legacy Yomu Note preferences READ-ONLY;
         # never import recent/open notebook paths into this test build.
         if os.environ.get('YOMU_INTEGRATION_DEV') == '1':
             from .dev_preferences import import_from_user_preferences
@@ -7599,16 +8358,17 @@ class MainWindow(QMainWindow):
         if not self.settings.value('preferencesMigrated', False, type=bool):
             previous = (QSettings('Yomu Dev Empty Legacy', 'Yomu Dev Empty Legacy')
                         if os.environ.get('YOMU_INTEGRATION_DEV') == '1'
-                        else QSettings('Sumi Study', 'Sumi Study'))
+                        else QSettings('Yomu Note', 'Yomu Note'))
             for key in ('theme', 'defaultFont', 'defaultFontSize', 'defaultBold',
                         'defaultItalic', 'defaultAlignment', 'lastOpenDir',
-                        'lastSaveDir', 'recentProjects', 'openProjects'):
+                        'lastSaveDir', 'reducedMotion', 'animationStyle',
+                        'previewClarity'):
                 if not self.settings.contains(key) and previous.contains(key):
                     self.settings.setValue(key, previous.value(key))
             self.settings.setValue('preferencesMigrated', True)
-        self.theme = self.settings.value('theme', 'washi')
+        self.theme = self.settings.value('theme', 'pinbu-quilt')
         if self.theme not in THEME_NAMES:
-            self.theme = 'washi'
+            self.theme = 'pinbu-quilt'
         self.notebook = None
         self._exchange_busy = False
         self._background_save_ticket = None
@@ -7709,7 +8469,7 @@ class MainWindow(QMainWindow):
         header_layout = QHBoxLayout(self.header)
         header_layout.setContentsMargins(11, 2, 11, 2)
         header_layout.setSpacing(8)
-        self.brand = YomuWordmark(self.header)
+        self.brand = PinbuWordmark(self.header)
         header_layout.addWidget(self.brand, 0, Qt.AlignmentFlag.AlignVCenter)
         # The single notebook-wide summary stays visible across tab changes.
         notebook_header = QWidget(self.header)
@@ -7761,7 +8521,8 @@ class MainWindow(QMainWindow):
         self.backup_timer = QTimer(self)
         self.backup_timer.setInterval(10 * 60 * 1000)  # rotating snapshots every 10 min
         self.backup_timer.timeout.connect(self._periodic_backup)
-        paths = self.settings.value('openProjects', [])
+        paths = ([str(initial_path)] if initial_path is not None
+                 else self.settings.value('openProjects', []))
         if isinstance(paths, str):
             paths = [paths]
         startup_errors = []
@@ -7774,15 +8535,15 @@ class MainWindow(QMainWindow):
                 logger.exception('Could not reopen previous notebook')
                 startup_errors.append((str(path), str(exc)))
         if self.notebook is None:
-            self.show_notebook(Notebook.create(Path.home() / 'Documents' / 'Yomu Note',
-                                               'My First Notes'))
+            self.show_notebook(Notebook.create(Path.home() / 'Documents' / 'Pinbu Note',
+                                               'My First Notes', extension='.pinbunote'))
         self.change_tab()
         if startup_errors:
             file_path, problem = startup_errors[0]
             QTimer.singleShot(0, lambda p=file_path, e=problem:
                 QMessageBox.warning(
                     self, 'Previous notebook could not open',
-                    f'Yomu Note could not reopen:\n{p}\n\n{e}\n\n'
+                    f'Pinbu Note could not reopen:\n{p}\n\n{e}\n\n'
                     'The original notebook has NOT been modified.\n'
                     'Use File → Open to retry or attempt recovery.'))
 
@@ -7844,6 +8605,41 @@ class MainWindow(QMainWindow):
             with QSignalBlocker(action):
                 action.setChecked(pane._navigator_visible)
 
+    def _populate_notebook_bookmarks(self):
+        menu = self.notebook_bookmarks_menu
+        menu.clear()
+        pane = self.active()
+        if pane and pane.current_page():
+            menu.addAction('Bookmark current page…',
+                           lambda: pane.add_page_bookmark())
+            menu.addSeparator()
+        count = 0
+        for index in range(self.tabs.count()):
+            pane = self.tabs.widget(index)
+            bookmarks = [p for p in pane.project.pages if p.get('bookmark')]
+            if not bookmarks:
+                continue
+            submenu = menu.addMenu(self.tabs.tabText(index))
+            for page in bookmarks:
+                if count >= 500:
+                    break
+                submenu.addAction(page['bookmark'],
+                    lambda _=False, idx=index, pid=page['id']:
+                    self._jump_to_bookmark(idx, pid))
+                count += 1
+            if count >= 500:
+                break
+        if count == 0:
+            menu.addAction('No bookmarked pages yet').setEnabled(False)
+
+    def _jump_to_bookmark(self, tab_index, page_id):
+        if not 0 <= tab_index < self.tabs.count():
+            return
+        self.tabs.setCurrentIndex(tab_index)
+        pane = self.tabs.widget(tab_index)
+        if pane is not None:
+            pane.select_page_id(page_id)
+
     def configure_actions(self):
         file_menu = self.menuBar().addMenu('&File')
         new = self.action('New Project…', self.new_project, QKeySequence.StandardKey.New)
@@ -7874,7 +8670,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.action('Close Project', self.close_current, QKeySequence.StandardKey.Close))
         file_menu.addAction(self.action('Restore Backup As…', self.restore_backup))
         file_menu.addSeparator()
-        file_menu.addAction(self.action('Quit Yomu Note', self.close,
+        file_menu.addAction(self.action('Quit Pinbu Note', self.close,
                                         QKeySequence.StandardKey.Quit))
 
         edit = self.menuBar().addMenu('&Edit')
@@ -7908,6 +8704,11 @@ class MainWindow(QMainWindow):
         edit.addAction(self.action('Find Previous in Notes',
                         lambda: self.active() and self.active().notes.find_previous(), 'Ctrl+Shift+G'))
 
+        # One notebook-wide jump list, rebuilt from LIVE panes on open.
+        # Bookmarks follow page IDs, not mutable page numbers.
+        self.notebook_bookmarks_menu = self.menuBar().addMenu('&Bookmarks')
+        self.notebook_bookmarks_menu.aboutToShow.connect(self._populate_notebook_bookmarks)
+
         insert = self.menuBar().addMenu('&Insert')
         insert.addAction(self.action('Horizontal Line',
             lambda: self.active() and self.active().notes.insert_horizontal_line()))
@@ -7920,8 +8721,17 @@ class MainWindow(QMainWindow):
         self.navigator_visibility_action.triggered.connect(self._set_active_navigator_visibility)
         view.addSeparator()
         themes = view.addMenu('Colour Theme')
-        for key, title in THEME_NAMES.items():
-            themes.addAction(self.action(title, lambda _checked=False, key=key: self.set_theme(key)))
+        self._theme_menu = themes
+        themes.aboutToShow.connect(self._populate_theme_menu)
+        self._extra_scroll_action = view.addAction('Allow extra vertical page scrolling')
+        self._extra_scroll_action.setCheckable(True)
+        self._extra_scroll_action.setChecked(
+            str(self.settings.value('readingExtraScroll', 'false')).lower() == 'true')
+        self._extra_scroll_action.setToolTip(
+            'Scroll a slide beyond its top and bottom edges to centre it in the preview.')
+        self._extra_scroll_action.toggled.connect(self._set_extra_scroll_everywhere)
+        view.addAction(self.action('Centre current page vertically',
+            lambda: self.active() and self.active().centre_current_page()))
         view.addAction(self.action('Fit Page to Preview', lambda: self.active() and self.active().canvas.fit_page()))
         view.addAction(self.action('Actual Image Pixels', lambda: self.active() and self.active().canvas_actual()))
         view.addSeparator()
@@ -7941,7 +8751,7 @@ class MainWindow(QMainWindow):
         options.addAction(self.action('Notes Page Setup…',
             lambda: self.active() and self.active().show_notes_page_setup()))
         help_menu = self.menuBar().addMenu('&Help')
-        help_menu.addAction(self.action('About Yomu Note', self.show_about))
+        help_menu.addAction(self.action('About Pinbu Note', self.show_about))
 
         # All header actions wrap instead of disappearing behind toolbar overflow.
         for act, label, tip in [
@@ -8326,7 +9136,7 @@ class MainWindow(QMainWindow):
             # Persist the last selected internal tab promptly, even when
             # notes haven't changed since the previous autosave.
             self.notebook.save()
-        self.setWindowTitle(f'{self.notebook.name} — Yomu Note')
+        self.setWindowTitle(f'{self.notebook.name} — Pinbu Note')
         self._update_undo_actions()
         self._update_notebook_progress()
 
@@ -8794,9 +9604,15 @@ class MainWindow(QMainWindow):
         Recovery is opt-in. Invalid annotations may be skipped,
         but the source notebook is left exactly as it was.
         """
+        if self.notebook and Path(path).expanduser().resolve() == self.notebook.path:
+            self.statusBar().showMessage('This notebook is already open in this window.', 3500)
+            return
         try:
             notebook = Notebook.load(Path(path))
             self.show_notebook(notebook)
+        except NotebookInUseError as exc:
+            QMessageBox.warning(self, 'Notebook already open', str(exc))
+            return  # Do not offer destructive/duplicate recovery for a live notebook.
         except Exception as exc:
             logger.exception('Could not open notebook')
             answer = QMessageBox.question(
@@ -8830,10 +9646,10 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, 'Choose project storage folder', start)
         if not folder:
             return
-        name, ok = QInputDialog.getText(self, 'New Yomu Note project', 'Project name:', text='New Study Project')
+        name, ok = QInputDialog.getText(self, 'New Pinbu Note project', 'Project name:', text='New Study Project')
         if ok and name.strip():
             try:
-                notebook = Notebook.create(Path(folder), name)
+                notebook = Notebook.create(Path(folder), name, extension='.pinbunote')
                 self.settings.setValue('lastSaveDir', folder)
                 self.show_notebook(notebook)
             except Exception as exc:
@@ -8841,8 +9657,8 @@ class MainWindow(QMainWindow):
 
     def open_project(self):
         start = self.settings.value('lastOpenDir', str(Path.home() / 'Documents'))
-        path, _ = QFileDialog.getOpenFileName(self, 'Open Yomu Note notebook', start,
-                                               'Yomu Note Notebooks (*.yomunote *.yominote)')
+        path, _ = QFileDialog.getOpenFileName(self, 'Open Pinbu Note notebook', start,
+                                               'Pinbu Note Notebooks (*.pinbunote *.yomunote *.yominote)')
         if path:
             self.open_path(path)
 
@@ -8888,8 +9704,8 @@ class MainWindow(QMainWindow):
         destination, _ = QFileDialog.getSaveFileName(
             self, 'Export clean notebook for sharing',
             str(self.notebook.path.with_name(
-                self.notebook.path.stem + ' Clean Copy.yomunote')),
-            'Yomu Note Notebook (*.yomunote)',
+                self.notebook.path.stem + ' Clean Copy.pinbunote')),
+            'Pinbu Note Notebook (*.pinbunote *.yomunote)',
         )
         if not destination:
             return
@@ -8931,7 +9747,7 @@ class MainWindow(QMainWindow):
         self._exchange_busy = True
         self._exchange_cancel = threading.Event()
         progress = QProgressDialog(message, 'Cancel', 0, 0, self)
-        progress.setWindowTitle('Yomu Note · Tab Exchange')
+        progress.setWindowTitle('Pinbu Note · Tab Exchange')
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
@@ -8976,9 +9792,9 @@ class MainWindow(QMainWindow):
             return
         if isinstance(source_path, bool) or not source_path:
             source_path, _ = QFileDialog.getOpenFileName(
-                self, 'Import tabs from another Yomu Note notebook',
+                self, 'Import tabs from another Pinbu Note notebook',
                 str(self.settings.value('lastOpenDir', str(Path.home()))),
-                'Yomu Note Notebooks (*.yomunote *.yominote)')
+                'Pinbu Note Notebooks (*.pinbunote *.yomunote *.yominote)')
         if not source_path:
             return
         path = Path(source_path).expanduser().resolve()
@@ -9105,15 +9921,15 @@ class MainWindow(QMainWindow):
         if not ids:
             return
         suggested = self.notebook.path.with_name(
-            self.notebook.path.stem + ' Shared Tabs.yomunote')
+            self.notebook.path.stem + ' Shared Tabs.pinbunote')
         dest, _ = QFileDialog.getSaveFileName(
             self, 'Save selected tabs as a separate notebook',
-            str(suggested), 'Yomu Note Notebooks (*.yomunote)')
+            str(suggested), 'Pinbu Note Notebooks (*.pinbunote *.yomunote)')
         if not dest:
             return
         target = Path(dest).expanduser().resolve()
-        if target.suffix.lower() != '.yomunote':
-            target = target.with_suffix('.yomunote')
+        if target.suffix.lower() not in ('.pinbunote', '.yomunote'):
+            target = target.with_suffix('.pinbunote')
         if target.exists():
             QMessageBox.warning(self, 'Choose a new filename',
                                 'Tab export never overwrites another notebook.')
@@ -9148,7 +9964,7 @@ class MainWindow(QMainWindow):
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
         return (urls[0].toLocalFile() if len(urls) == 1 and urls[0].isLocalFile()
                 and Path(urls[0].toLocalFile()).suffix.lower() in
-                ('.yomunote', '.yominote') else None)
+                ('.pinbunote', '.yomunote', '.yominote') else None)
 
     def dragEnterEvent(self, event):
         if self._notebook_drag_path(event):
@@ -9180,8 +9996,8 @@ class MainWindow(QMainWindow):
         self._save_current_tab()
         self.notebook.save()
         target, _ = QFileDialog.getSaveFileName(self, 'Save project copy',
-            str(self.notebook.path.with_name(self.notebook.path.stem + ' Copy.yomunote')),
-            'Yomu Note Notebook (*.yomunote)')
+            str(self.notebook.path.with_name(self.notebook.path.stem + ' Copy.pinbunote')),
+            'Pinbu Note Notebook (*.pinbunote *.yomunote)')
         if target:
             try:
                 dest = Path(target)
@@ -9225,7 +10041,7 @@ class MainWindow(QMainWindow):
                 self.save_open_tabs()
             finally:
                 self._changing_notebook = False
-            self.setWindowTitle('Yomu Note')
+            self.setWindowTitle('Pinbu Note')
             self._update_notebook_progress(animate=False)
 
     def save_open_tabs(self):
@@ -9252,14 +10068,14 @@ class MainWindow(QMainWindow):
 
     def restore_backup(self):
         folder = str(self.settings.value('backupDirectory', default_backup_folder()))
-        original, _ = QFileDialog.getOpenFileName(self, 'Select a Yomu recovery backup', folder,
-                                                  'Yomu Note Notebooks (*.yomunote *.yominote)')
+        original, _ = QFileDialog.getOpenFileName(self, 'Select a Pinbu Note or older Yomu Note recovery backup', folder,
+                                                  'Pinbu Note Notebooks (*.pinbunote *.yomunote *.yominote)')
         if not original:
             return
-        suggested = str((self.notebook.path if self.notebook else Path(folder)/'Recovered.yomunote')
-                         .with_name('Recovered ' + Path(original).stem + '.yomunote'))
+        suggested = str((self.notebook.path if self.notebook else Path(folder)/'Recovered.pinbunote')
+                         .with_name('Recovered ' + Path(original).stem + '.pinbunote'))
         destination, _ = QFileDialog.getSaveFileName(self, 'Restore backup to a NEW project file',
-            suggested, 'Yomu Note Notebook (*.yomunote)')
+            suggested, 'Pinbu Note Notebook (*.pinbunote *.yomunote)')
         if not destination:
             return
         try:
@@ -9267,6 +10083,26 @@ class MainWindow(QMainWindow):
             self.open_path(output)
         except Exception as exc:
             QMessageBox.warning(self, 'Restore failed', str(exc))
+
+    def _populate_theme_menu(self):
+        """Group names by visual inspiration, preserving saved theme IDs."""
+        self._theme_menu.clear()
+        for pack, keys in THEME_PACKS.items():
+            submenu = self._theme_menu.addMenu(pack)
+            for key in keys:
+                action = submenu.addAction(THEME_NAMES[key])
+                action.setCheckable(True)
+                action.setChecked(self.theme == key)
+                action.triggered.connect(
+                    lambda _checked=False, choice=key: self.set_theme(choice))
+
+    def _set_extra_scroll_everywhere(self, enabled):
+        """Opt-in across ungrouped pages; group-specific flags also work."""
+        self.settings.setValue('readingExtraScroll', bool(enabled))
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if pane is not None:
+                pane.refresh_extra_scroll_mode()
 
     def _theme_one_pane(self, pane):
         colours = getattr(self, 'current_palette', THEMES['washi'])
@@ -9314,7 +10150,7 @@ class MainWindow(QMainWindow):
     def show_preferences(self):
         """A scrollable preferences window; its Save/Cancel buttons stay visible."""
         dialog = QDialog(self)
-        dialog.setWindowTitle('Yomu Note Preferences')
+        dialog.setWindowTitle('Pinbu Note Preferences')
         dialog.resize(460, 560)
         outer = QVBoxLayout(dialog)
         scroll = QScrollArea(dialog)
@@ -9335,8 +10171,14 @@ class MainWindow(QMainWindow):
         outer.addWidget(scroll, 1)
         layout.addWidget(QLabel('Appearance'))
         theme = QComboBox()
-        theme.addItems(list(THEME_NAMES.values()))
-        theme.setCurrentIndex(list(THEME_NAMES).index(self.theme))
+        for pack, keys in THEME_PACKS.items():
+            theme.addItem(f'── {pack} ──', None)
+            header = theme.model().item(theme.count()-1)
+            if header is not None:
+                header.setEnabled(False)
+            for key in keys:
+                theme.addItem('   ' + THEME_NAMES[key], key)
+        theme.setCurrentIndex(max(0, theme.findData(self.theme)))
         layout.addWidget(theme)
         layout.addWidget(QLabel('Default notes style (applies to new notes only)'))
         font = QFontComboBox()
@@ -9410,7 +10252,13 @@ class MainWindow(QMainWindow):
         start_top = QCheckBox('Start previously unvisited pages at the top')
         start_top.setChecked(str(self.settings.value('readingViewStartAtTop', 'true')).lower() == 'true')
         layout.addWidget(start_top)
-        layout.addWidget(QLabel('Yomu Focus · gentle chiptune sounds in E♭ major'))
+        extra_scroll = QCheckBox('Allow extra vertical page scrolling (centre short slides)')
+        extra_scroll.setChecked(str(self.settings.value(
+            'readingExtraScroll', 'false')).lower() == 'true')
+        extra_scroll.setToolTip('Adds blank scroll space around PDF and slide pages. '
+            'You can also enable it separately for an individual page group.')
+        layout.addWidget(extra_scroll)
+        layout.addWidget(QLabel('Pinbu Focus · gentle chiptune sounds in E♭ major'))
         focus_sounds = QCheckBox('Play original 3-second jingles when sessions end')
         focus_sounds.setChecked(str(self.settings.value('focusSounds', 'true')).lower() == 'true')
         layout.addWidget(focus_sounds)
@@ -9426,7 +10274,7 @@ class MainWindow(QMainWindow):
         focus_volume.setToolTip('Jingle playback volume; 0% is silent.')
         volume_line.addWidget(focus_volume)
         layout.addLayout(volume_line)
-        layout.addWidget(QLabel('Yomu Focus · session durations (minutes)'))
+        layout.addWidget(QLabel('Pinbu Focus · session durations (minutes)'))
         durations = QHBoxLayout()
         session_spins = []
         for title, key, default in [('Focus', 'pomodoroFocus', 25),
@@ -9465,7 +10313,7 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         outer.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.set_theme(list(THEME_NAMES)[theme.currentIndex()])
+            self.set_theme(theme.currentData())
             self.settings.setValue('defaultFont', font.currentFont().family())
             self.settings.setValue('defaultFontSize', size.value())
             self.settings.setValue('defaultBold', bold.isChecked())
@@ -9483,6 +10331,7 @@ class MainWindow(QMainWindow):
             self.settings.setValue('readingViewRememberScroll', remember_scroll.isChecked())
             self.settings.setValue('readingViewPersist', persist_view.isChecked())
             self.settings.setValue('readingViewStartAtTop', start_top.isChecked())
+            self._extra_scroll_action.setChecked(extra_scroll.isChecked())
             self.settings.setValue('backupDirectory', backup_dir.text().strip() or str(default_backup_folder()))
             self.settings.setValue('backupCount', backup_count.value())
             self.settings.setValue('focusSounds', focus_sounds.isChecked())
@@ -9529,9 +10378,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(popup)
         layout.setContentsMargins(24,20,24,20)
         layout.setSpacing(9)
-        for text, style in [('Yomu ❤︎', 'font-size: 25px; font-weight: bold;'),
-                            ('べんきょうして！', 'font-size: 13px;'),
-                            (f'Yomu Note  ·  v{__version__}', 'font-size: 14px; font-weight: bold;'),
+        for text, style in [('Pinbu ♥', 'font-size: 27px; font-weight: bold;'),
+                            ('N O T E', 'font-size: 10px; font-weight: bold;'),
+                            (f'Pinbu Note  ·  v{__version__}', 'font-size: 14px; font-weight: bold;'),
                             ('A cosy offline space for reading and learning ✿', 'font-size: 12px;'),
                             ('Designed by Nova O’Reilly!', 'font-size: 13px; font-weight: bold;')]:
             label = QLabel(text)
@@ -9552,7 +10401,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if any(self.tabs.widget(i)._importing for i in range(self.tabs.count())):
-            QMessageBox.information(self, 'Import active', 'Finish importing before closing Yomu Note.')
+            QMessageBox.information(self, 'Import active', 'Finish importing before closing Pinbu Note.')
             event.ignore()
             return
         try:
@@ -9561,6 +10410,19 @@ class MainWindow(QMainWindow):
                     self.tabs.widget(i) for i in range(self.tabs.count()))
             self.save_open_tabs()
             event.accept()
+        except NotebookExternallyModifiedError as exc:
+            answer = QMessageBox.question(
+                self, 'External changes detected — save blocked',
+                f'{exc}\n\nThe notebook on disk has NOT been overwritten.\n\n'
+                'Exit WITHOUT saving this session’s latest edits?\n'
+                'Choose No to stay open and inspect your recovery options.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                self.save_open_tabs()
+                event.accept()
+            else:
+                event.ignore()
         except Exception as exc:
             QMessageBox.critical(self, 'Could not save before exit', str(exc))
             event.ignore()

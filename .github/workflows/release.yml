@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing pushed tag to rebuild (e.g. v0.8.5)'
+        description: 'Existing pushed tag to rebuild (e.g. v0.8.7c)'
         required: true
-        default: 'v0.8.5'
+        default: 'v0.8.7c'
 permissions:
   contents: read
 # Ensure Windows Python reads source as UTF-8, not cp1252.
@@ -53,10 +53,10 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-windows.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-installer-windows.ps1
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          Copy-Item installer\YomuNote_Setup_v0.8.5.exe release-assets\
+          Copy-Item installer\PinbuNote_Setup_v0.8.7c.exe release-assets\
       - uses: actions/upload-artifact@v4
         with:
-          name: YomuNote-Windows-Setup
+          name: PinbuNote-Windows-Setup
           path: release-assets/*.exe
           if-no-files-found: error
   macos:
@@ -100,7 +100,7 @@ jobs:
           bash scripts/package-macos-dmg.sh "${{ matrix.architecture }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: YomuNote-macOS-${{ matrix.architecture }}
+          name: PinbuNote-macOS-${{ matrix.architecture }}
           path: release-assets/*.dmg
           if-no-files-found: error
 
@@ -116,16 +116,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
-          pattern: YomuNote-*
+          pattern: PinbuNote-*
           merge-multiple: true
       - name: Check Windows and both macOS downloads exist
         shell: bash
         run: |
           set -euo pipefail
           ls -lh release-assets
-          test -s release-assets/YomuNote_Setup_v0.8.5.exe
-          test -s release-assets/YomuNote-0.8.5-macOS-arm64-unsigned.dmg
-          test -s release-assets/YomuNote-0.8.5-macOS-x86_64-unsigned.dmg
+          test -s release-assets/PinbuNote_Setup_v0.8.7c.exe
+          test -s release-assets/PinbuNote-0.8.7c-macOS-arm64-unsigned.dmg
+          test -s release-assets/PinbuNote-0.8.7c-macOS-x86_64-unsigned.dmg
           ( cd release-assets && sha256sum * > SHA256SUMS.txt )
       - name: Create unpublished draft with installers
         shell: bash
@@ -136,6 +136,6 @@ jobs:
           set -euo pipefail
           gh release create "$RELEASE_TAG" release-assets/* \
             --verify-tag --draft --prerelease \
-            --title "Yomu Note $RELEASE_TAG (pre-release)" \
-            --notes-file RELEASE_NOTES_v0.8.5.md
+            --title "Pinbu Note $RELEASE_TAG (pre-release)" \
+            --notes-file RELEASE_NOTES_v0.8.7c.md
           echo 'Open the draft release, verify each download, then publish manually.' >> "$GITHUB_STEP_SUMMARY"

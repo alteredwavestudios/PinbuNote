@@ -53,6 +53,7 @@ ICON_PATHS = {
     'shapes': '<rect x="2" y="9" width="11" height="11" rx="0"/><circle cx="16.5" cy="7" r="4.5"/><path d="M14 20l3-5 4 5z"/>',
     'eraser': '<path d="m8 4 12 12-5 5H7l-5-5z M5 19l9-10 M11 21h10"/>',
     'link-2': '<path d="M10 13l4-4 M8 16H7a5 5 0 0 1 0-10h5 M16 8h1a5 5 0 0 1 0 10h-5"/>',
+    'image': '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="1.5"/><path d="M4 18l6-6 4 4 3-3 4 5"/>',
     'more': '<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>',
     'fit': '<path d="M4 9V4h5 M15 4h5v5 M20 15v5h-5 M9 20H4v-5"/>',
     'trash-2': '<path d="M3 6h18 M9 6V4h6v2 M6 6l1 15h10l1-15 M10 10v7 M14 10v7"/>',
@@ -288,7 +289,7 @@ class WrapBar(QWidget):
         return action
 
 
-class YomuWordmark(QWidget):
+class PinbuWordmark(QWidget):
     """A responsive, clickable two-line wordmark with on-demand hover motion.
 
     The logo's gradient only animates while hovered, preventing constant redraws
@@ -305,12 +306,12 @@ class YomuWordmark(QWidget):
         self._flash_level = 0.0
         self._phase = 0.0
         self._reduce_motion = False
-        self.setMinimumWidth(110)
-        self.setMaximumWidth(190)
+        self.setMinimumWidth(124)
+        self.setMaximumWidth(210)
         self.setFixedHeight(55)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip('About Yomu Note · click for version and credits')
-        self.setAccessibleName('About Yomu Note')
+        self.setToolTip('About Pinbu Note · click for version and credits')
+        self.setAccessibleName('About Pinbu Note')
         # Cache system font discovery. Calling QFontDatabase.families() from
         # paintEvent on every frame is slow and may interrogate bitmap fonts.
         fonts = set(QFontDatabase.families())
@@ -395,15 +396,19 @@ class YomuWordmark(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        label = 'Yomu ❤︎'
+        # Font-size-relative tracking prevents narrow and wide labels from
+        # receiving the same (incorrect) fixed-pixel character spacing.
+        label = 'Pinbu ♥'
         font = QFont(self._headline_family)
         font.setWeight(QFont.Weight.DemiBold)
-        font.setPixelSize(min(29, max(16, int(self.width() * .185))))
-        while font.pixelSize() > 15 and QFontMetricsF(font).horizontalAdvance(label) > self.width()-7:
+        font.setPixelSize(min(30, max(16, int(self.width() * .165))))
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 101)
+        while font.pixelSize() > 15 and QFontMetricsF(font).horizontalAdvance(label) > self.width()-10:
             font.setPixelSize(font.pixelSize()-1)
         fm = QFontMetricsF(font)
         path = QPainterPath()
-        path.addText((self.width()-fm.horizontalAdvance(label))/2, 5+fm.ascent(), font, label)
+        path.addText((self.width()-fm.horizontalAdvance(label))/2,
+                     5+fm.ascent(), font, label)
         p.save()
         p.translate(0, 2)
         p.scale(1, .86)
@@ -424,11 +429,17 @@ class YomuWordmark(QWidget):
             white = QColor('#ffffff'); white.setAlpha(145)
             p.fillPath(path, white)
         p.restore()
+        # A true tracked subtitle, not letters separated by arbitrary spaces.
+        # Percentage spacing automatically scales with the subtitle font size.
+        subtitle = 'NOTE'
         font = QFont(self._subtitle_family)
-        font.setPixelSize(min(12, max(9, int(self.width()*.07))))
+        font.setWeight(QFont.Weight.DemiBold)
+        font.setPixelSize(min(11, max(8, int(self.width()*.059))))
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 165)
         p.setFont(font)
         p.setPen(self._sub)
-        p.drawText(QRect(3, 35, self.width()-6, 17), Qt.AlignmentFlag.AlignCenter, 'べんきょうして！')
+        p.drawText(QRect(3, 37, self.width()-6, 15),
+                   Qt.AlignmentFlag.AlignCenter, subtitle)
         p.end()
 
 
@@ -793,7 +804,7 @@ class FocusTimer(QToolButton):
         self.setFixedWidth(119)
         self.setMinimumHeight(31)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip('Yomu Focus · click to start/pause; right-click to choose a break or reset')
+        self.setToolTip('Pinbu Focus · click to start/pause; right-click to choose a break or reset')
         self._update_display()
 
     def _setup_sounds(self):
@@ -1053,3 +1064,7 @@ class SoftButtonMotion(QObject):
                          else 0)
         glow.start()
         return False
+
+
+# Backward-compatible alias for older integrations; the new UI uses PinbuWordmark.
+YomuWordmark = PinbuWordmark

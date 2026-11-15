@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_windows_setup_does_not_launch_gui_postinstall():
-    source = (ROOT / 'YomuNote_v050_Installer.iss').read_text(encoding='utf-8')
+    source = (ROOT / 'PinbuNote_Installer.iss').read_text(encoding='utf-8')
     match = re.search(r'(?ms)^\[Run\]\s*\n(.*?)(?=^\[|\Z)', source)
     if match:
         active = [line.strip() for line in match.group(1).splitlines()

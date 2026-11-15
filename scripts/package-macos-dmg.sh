@@ -4,14 +4,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 arch="${1:-$(uname -m)}"
-version="0.8.5"
-app="$PWD/dist/Yomu Note.app"
+version="0.8.7c"
+app="$PWD/dist/Pinbu Note.app"
 [[ -d "$app" ]] || { echo "Missing built application: $app" >&2; exit 1; }
 mkdir -p release-assets
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
-cp -R "$app" "$stage/Yomu Note.app"
+cp -R "$app" "$stage/Pinbu Note.app"
 ln -s /Applications "$stage/Applications"
-hdiutil create -volname "Yomu Note $version" -srcfolder "$stage" -format UDZO -ov \
-  "$PWD/release-assets/YomuNote-${version}-macOS-${arch}-unsigned.dmg"
+hdiutil create -volname "Pinbu Note $version" -srcfolder "$stage" -format UDZO -ov \
+  "$PWD/release-assets/PinbuNote-${version}-macOS-${arch}-unsigned.dmg"
 echo 'Unsigned DMG created. Do not describe this as signed/notarized.'

@@ -9,8 +9,9 @@ children.  Qt handles the indentation and disclosure arrows for us.
 """
 from __future__ import annotations
 import json
-from PySide6.QtCore import Qt, Signal, QMimeData, QSize, QRect, QPoint, QPointF, QRectF, QVariantAnimation, QEasingCurve, QAbstractAnimation, QEvent
+from PySide6.QtCore import Qt, Signal, QMimeData, QSize, QRect, QPoint, QPointF, QRectF, QVariantAnimation, QEasingCurve, QAbstractAnimation, QEvent, QPersistentModelIndex
 from PySide6.QtGui import QDrag, QKeySequence, QFont, QPainter, QColor, QIcon, QPalette, QPen
+from .bookmark_badge import paint_bookmark_ribbon
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QTreeWidget,
                               QTreeWidgetItem, QStyledItemDelegate,
                               QStyle, QStyleOptionViewItem)
@@ -22,6 +23,7 @@ PAGE_MIME = 'application/x-yomu-notebook-pages'
 ROLE_ACTIVE = Qt.ItemDataRole.UserRole + 2
 ROLE_ACTIVE_ANCESTOR = Qt.ItemDataRole.UserRole + 3
 ROLE_PROGRESS = Qt.ItemDataRole.UserRole + 4
+ROLE_BOOKMARK = Qt.ItemDataRole.UserRole + 5
 
 
 class GroupRowDelegate(QStyledItemDelegate):
@@ -280,6 +282,9 @@ class GroupRowDelegate(QStyledItemDelegate):
         # Overlay just the checkbox in the same native hit rectangle.
         self._paint_read_indicator(
             painter, option, index)
+        if index.data(ROLE_KIND) == 'page' and index.data(ROLE_BOOKMARK):
+            paint_bookmark_ribbon(painter, option.rect.right()-19,
+                                  option.rect.top()+6, self.accent, .83)
         if not (index.data(ROLE_ACTIVE) or
                 index.data(ROLE_ACTIVE_ANCESTOR)):
             return
@@ -350,6 +355,10 @@ class PageGroupsTree(QTreeWidget):
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._rebuilding = False
         self._last_tree = []
+        # Persistent indexes invalidate automatically on Qt item moves/removal.
+        # Replaces recursive O(number-of-pages) searches on every new thumbnail
+        # and each page navigation with O(1) lookups when the tree is stable.
+        self._item_indexes = {}
         self.itemClicked.connect(self._clicked)
         self.itemChanged.connect(self._read_check_changed)
         self.itemExpanded.connect(lambda item: self._collapse(item, False))
@@ -454,6 +463,7 @@ class PageGroupsTree(QTreeWidget):
             self._active_painted.clear()
             self._thumb_ids.clear()
             self._check_states.clear()
+            self._item_indexes.clear()
             self._last_tree = groups
 
             def fill(parent, nodes):
@@ -487,6 +497,8 @@ class PageGroupsTree(QTreeWidget):
                             self.addTopLevelItem(item)
                         else:
                             parent.addChild(item)
+                        self._item_indexes[('group', node['id'])] = QPersistentModelIndex(
+                            self.indexFromItem(item, 0))
                         fill(item, node['children'])
                         item.setExpanded(not node['collapsed'])
                     else:
@@ -502,7 +514,11 @@ class PageGroupsTree(QTreeWidget):
                             else Qt.CheckState.Unchecked)
                         self._check_states[('page', pid)] = item.checkState(0)
                         item.setData(0, ROLE_ID, pid)
-                        item.setToolTip(0, title + ' · Tick to mark read')
+                        bookmark = by_id.get(pid, {}).get('bookmark')
+                        item.setData(0, ROLE_BOOKMARK, bool(bookmark))
+                        item.setToolTip(0, title +
+                                        (f' · 🔖 {bookmark}' if bookmark else '') +
+                                        ' · Tick to mark read')
                         # A page may be dropped BETWEEN others, but cannot
                         # contain child items.  Only folders accept children.
                         item.setFlags((item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
@@ -511,6 +527,8 @@ class PageGroupsTree(QTreeWidget):
                             self.addTopLevelItem(item)
                         else:
                             parent.addChild(item)
+                        self._item_indexes[('page', pid)] = QPersistentModelIndex(
+                            self.indexFromItem(item, 0))
             fill(None, groups)
             self.mark_active(active_page)
         finally:
@@ -626,19 +644,38 @@ class PageGroupsTree(QTreeWidget):
         self._thumb_ids.intersection_update(keep)
 
     def find_item(self, kind, identifier):
+        """Resolve a fresh Qt item through its stable persistent model index."""
+        index = self._item_indexes.get((kind, identifier))
+        if index is not None and index.isValid():
+            return self.itemFromIndex(index)
+        # Native Qt drag-and-drop can invalidate persistent indexes without
+        # reloading the tree. Rebuild just this one mapping on demand.
         def walk(item):
             if item.data(0, ROLE_KIND) == kind and item.data(0, ROLE_ID) == identifier:
+                self._item_indexes[(kind, identifier)] = QPersistentModelIndex(
+                    self.indexFromItem(item, 0))
                 return item
-            for index in range(item.childCount()):
-                found = walk(item.child(index))
-                if found is not None:
-                    return found
+            for n in range(item.childCount()):
+                result = walk(item.child(n))
+                if result is not None:
+                    return result
             return None
-        for index in range(self.topLevelItemCount()):
-            found = walk(self.topLevelItem(index))
-            if found is not None:
-                return found
+        for n in range(self.topLevelItemCount()):
+            result = walk(self.topLevelItem(n))
+            if result is not None:
+                return result
+        self._item_indexes.pop((kind, identifier), None)
         return None
+
+    def update_page_bookmark(self, page_id, label):
+        """Update one row's metadata and ribbon without expensive reloads."""
+        item = self.find_item('page', page_id)
+        if item is None:
+            return
+        item.setData(0, ROLE_BOOKMARK, bool(label))
+        title = item.text(0)
+        item.setToolTip(0, title + (f' · 🔖 {label}' if label else '') +
+                        ' · Tick to mark read')
 
     def selected_page_ids(self):
         """Return selected page IDs in *reading* order, not click order."""
@@ -659,15 +696,27 @@ class PageGroupsTree(QTreeWidget):
         return result
 
     def extract_tree(self):
-        """Describe the UI's proposed order for safe model validation."""
+        """Describe the UI order without losing group-specific preferences."""
+        previous = {}
+        def remember(nodes):
+            for node in nodes or []:
+                if node.get('type') == 'group':
+                    previous[node['id']] = node
+                    remember(node.get('children'))
+        remember(self._last_tree)
+
         def walk(item):
             kind = item.data(0, ROLE_KIND)
             if kind == 'page':
                 return {'type': 'page', 'page_id': item.data(0, ROLE_ID)}
-            return {'type': 'group', 'id': item.data(0, ROLE_ID),
-                    'name': item.text(0),
-                    'collapsed': not item.isExpanded(),
-                    'children': [walk(item.child(j)) for j in range(item.childCount())]}
+            group_id = item.data(0, ROLE_ID)
+            result = {'type': 'group', 'id': group_id,
+                      'name': item.text(0),
+                      'collapsed': not item.isExpanded(),
+                      'children': [walk(item.child(j)) for j in range(item.childCount())]}
+            if previous.get(group_id, {}).get('extra_vertical_scroll') is True:
+                result['extra_vertical_scroll'] = True
+            return result
         return [walk(self.topLevelItem(i)) for i in range(self.topLevelItemCount())]
 
     def startDrag(self, actions):

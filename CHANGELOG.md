@@ -1,3 +1,12 @@
+## v0.8.6b — Sticky Notes, Bookmarks & Notebook Safety (development)
+
+- Add skeuomorphic editable sticky-note annotations with colour, fonts and
+  per-note typography; preserve geometry, Undo/Redo and cross-tab transfers.
+- Introduce stable-ID page bookmarks with per-tab and global navigation.
+- Acquire a cross-process notebook write lease; detect older-version external
+  modifications and refuse conflicting saves; no new container schema.
+- Retain clipboard image/photo workflow from v0.8.6a.
+
 ## v0.8.5 — Reliability and performance public-preview candidate
 
 - Promotes the user-tested v0.8.4c feature set without changing the notebook schema.

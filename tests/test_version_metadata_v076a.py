@@ -63,5 +63,5 @@ def test_standalone_older_project_keeps_format_and_gets_current_tag(tmp_path):
 
 def test_about_reads_shared_version_instead_of_hardcoding(tmp_path):
     source = (Path(__file__).resolve().parents[1] / 'yomunote' / 'window.py').read_text(encoding='utf-8')
-    assert "f'Yomu Note  ·  v{__version__}'" in source
+    assert "f'Pinbu Note  ·  v{__version__}'" in source
     assert "Yomu Note  ·  v0.6.3" not in source
