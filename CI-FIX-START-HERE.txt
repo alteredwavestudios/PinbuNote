@@ -1,0 +1,28 @@
+YOMU NOTE v0.8.3b — CI REGRESSION FIX FOR EXISTING PR #4
+
+This five-file overlay targets commit f717c23 on branch
+feature/v0.8.3b-text-lab in alteredwavestudios/Yomu-Note.
+
+Corrections:
+- Preserve original '#ffcf69' colour when OLD project manifests have no
+  highlight_color field. New project creation still defaults to '#FFE536'.
+- Default standalone ImageCanvas colour to '#FFE536' as well.
+- Update old highlighter tests to the intended 80% Multiply opacity.
+- Replace fragile whitespace-sensitive source checks with AST checks.
+- Extend migration tests to cover fresh, explicit legacy, and missing-field colours.
+
+NOT A RELEASE. Do not merge or tag until GitHub Actions is green.
+
+Windows PowerShell (adjust the downloaded ZIP path as necessary):
+
+cd 'H:\dev\Yomu-Note-v083b-Git'
+git branch --show-current
+# It must say feature/v0.8.3b-text-lab
+Expand-Archive -LiteralPath "$env:USERPROFILE\Downloads\Yomu-Note-v0.8.3b-CI-Fix-Overlay.zip" -DestinationPath 'H:\dev\Yomu-Note-v083b-Git' -Force
+git diff --check
+git diff --stat
+git add yomunote/project.py yomunote/window.py tests/test_v054b_quick_edit_hover_qt.py tests/test_v054b_quick_edit_repaint_source.py tests/test_v2_migration.py
+git commit -m 'Fix highlight migration and align legacy opacity tests with v0.8.3b'
+git push origin feature/v0.8.3b-text-lab
+
+No new PR is needed. GitHub automatically checks PR #4 again.

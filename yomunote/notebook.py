@@ -20,12 +20,16 @@ import shutil
 import sqlite3
 import tempfile
 from contextlib import closing
+from dataclasses import dataclass
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
 from .project import Project, safe_name, unique_project_path, short_id
+from .reading_view import clean_reading_view
+from .snapshot_save import (SaveGuard, FrozenFile, SaveSnapshot,
+                            MAX_SNAPSHOT_JSON_BYTES)
 
 NOTEBOOK_VERSION = 5
 MAGIC_FORMAT = 'yomu-notebook'
@@ -99,6 +103,82 @@ def default_backup_folder():
     return Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local' / 'share'))) / 'Yomu Note' / 'Backups'
 
 
+
+# Snapshot only page-related metadata. Notes text, page setup and other tab
+# settings are deliberately NOT overwritten by cross-tab Undo/Redo.
+_TRANSFER_FIELDS = (
+    'pages', 'page_groups', 'read_page_ids', 'annotations',
+    'reading_view', 'selected_page',
+)
+
+
+def _page_state(project: Project) -> dict:
+    return {field: copy.deepcopy(getattr(project, field))
+            for field in _TRANSFER_FIELDS}
+
+
+def _set_page_state(project: Project, state: dict,
+                    expected: dict | None = None) -> None:
+    """Restore page structure without erasing unrelated reading positions.
+
+    Scroll positions do not create Undo commands. If someone has read a
+    DIFFERENT page since a transfer, undoing that transfer must not rewind
+    their more recent scroll position. Only view keys that actually differ
+    between the before/after transfer snapshots are restored.
+    """
+    for field in _TRANSFER_FIELDS:
+        if field != 'reading_view':
+            setattr(project, field, copy.deepcopy(state[field]))
+    if expected is None:
+        project.reading_view = copy.deepcopy(state['reading_view'])
+        return
+    current = project.reading_view if isinstance(project.reading_view, dict) else {}
+    old = expected.get('reading_view') or {}
+    desired = state.get('reading_view') or {}
+    merged = copy.deepcopy(current)
+    for field in ('positions', 'page_zooms', 'group_zooms'):
+        old_map = old.get(field, {})
+        new_map = desired.get(field, {})
+        old_map = old_map if isinstance(old_map, dict) else {}
+        new_map = new_map if isinstance(new_map, dict) else {}
+        present = merged.setdefault(field, {})
+        for key in set(old_map) | set(new_map):
+            if old_map.get(key) == new_map.get(key):
+                continue
+            if key in new_map:
+                present[key] = copy.deepcopy(new_map[key])
+            else:
+                present.pop(key, None)
+    for field in ('independent_pages', 'unshared_roots'):
+        old_ids = set(old.get(field) or [])
+        new_ids = set(desired.get(field) or [])
+        current_ids = set(merged.get(field) or [])
+        merged[field] = sorted((current_ids - (old_ids - new_ids))
+                               | (new_ids - old_ids))
+    project.reading_view = merged
+
+
+@dataclass
+class PageTransferChange:
+    """One reversible notebook-wide page transfer, without duplicating media."""
+    notebook_id: str
+    source_id: str
+    target_id: str
+    source_before: dict
+    target_before: dict
+    source_after: dict
+    target_after: dict
+    created_assets: tuple[str, ...]
+    move: bool
+
+    @property
+    def estimated_bytes(self) -> int:
+        return sum(len(json.dumps(state, ensure_ascii=False).encode('utf-8'))
+                   for state in (self.source_before, self.target_before,
+                                 self.source_after, self.target_after)) + 512
+
+
+
 class Notebook:
     """Own one portable study notebook and its temporary editing workspace.
 
@@ -123,6 +203,7 @@ class Notebook:
         self._saved_manifest = None
         self.backup_dirty = False
         self._closed = False
+        self._save_guard = SaveGuard()
 
     @classmethod
     def _new_workspace(cls, path, name, tabs, active_id, identifier):
@@ -228,6 +309,20 @@ class Notebook:
                             recover_cosmetic=recover_cosmetic,
                             recovery_warnings=nb.recovery_warnings,
                         )
+                        # Old versions could silently omit live assets. Do not
+                        # pretend a notebook opened successfully if an original
+                        # or a converted render file is missing from its ZIP-like
+                        # SQLite container. The original file remains untouched.
+                        for page in project.pages:
+                            for field in ('source', 'render_source', 'file'):
+                                relative = page.get(field)
+                                if relative:
+                                    entry = project.asset_path(relative)
+                                    if not entry.is_file() or entry.is_symlink():
+                                        raise ValueError(
+                                            f'Notebook is missing a page asset in tab '
+                                            f'"{project.name}": {relative}. '
+                                            'Try restoring a known-good backup.')
                         if recover_cosmetic and nb.recovery_warnings:
                             # The ORIGINAL notebook file is never altered.
                             # Recovery is only allowed on a separate copy.
@@ -334,72 +429,193 @@ class Notebook:
         self.tabs.insert(destination, item)
 
     def transfer_pages(self, source_id: str, target_id: str,
-                       page_ids: list[str], move: bool = False):
-        """Copy/move pages between internal tabs without touching cache files.
+                       page_ids: list[str], move: bool = False,
+                       *, return_change: bool = False):
+        """Commit a copy/move as ONE notebook transaction.
 
-        Source files are copied only ONCE per distinct original path, even if
-        the user drags multiple pages from the same 300-page PDF. Each tab
-        retains independent annotations and its own source directory.
+        Files are copied to a staging directory first, then installed under
+        unique names. The two temporary project manifests are restored if
+        any stage, manifest write, or SQLite commit fails. SQLite itself
+        supplies crash-safe all-or-nothing durability for the portable file.
         """
         if source_id == target_id:
             raise ValueError('Choose another tab as the destination.')
         source = self.project(source_id)
         target = self.project(target_id)
-        selected = [p for p in source.pages if p['id'] in set(page_ids)]
+        selected_ids = set(page_ids)
+        selected = [p for p in source.pages if p['id'] in selected_ids]
         if not selected:
-            return 0
-        mapping = {}
+            return (0, None) if return_change else 0
+        if len(selected) + len(target.pages) > 20_000:
+            raise ValueError('Destination tab would exceed the 20,000-page limit.')
+
+        source_before = _page_state(source)
+        target_before = _page_state(target)
+        promoted: list[Path] = []
+        mapping: dict[str, str] = {}
         new_pages = []
-        for original in selected:
-            item = copy.deepcopy(original)
-            old_id = item['id']
-            item['id'] = short_id()
-            for field in ('source', 'render_source', 'file'):
-                old_relative = item.get(field)
-                if not old_relative:
-                    continue
-                if old_relative not in mapping:
-                    rel = Path(old_relative)
-                    if rel.parts[0] not in ('originals', 'pages'):
-                        raise ValueError('Cannot transfer a cached file as a page source.')
-                    # Destination paths must be safe even for legacy PDFs with
-                    # unusually long original filenames.
-                    new_relative = (
-                        f'{rel.parts[0]}/{short_id()}{rel.suffix.lower()}')
-                    origin = source.asset_path(old_relative)
-                    if not origin.is_file() or origin.is_symlink():
-                        raise ValueError('Source document is missing or unsafe.')
-                    destination = target.asset_path(new_relative)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(origin, destination)
-                    mapping[old_relative] = new_relative
-                item[field] = mapping[old_relative]
-            if old_id in source.annotations:
-                target.annotations[item['id']] = copy.deepcopy(source.annotations[old_id])
-            # Moving a page preserves completion. Copying creates a new
-            # unread page, even if the original was already finished.
-            if move and old_id in source.read_page_ids:
-                target.read_page_ids.append(item['id'])
-            new_pages.append(item)
-        target.pages.extend(new_pages)
-        target.selected_page = new_pages[0]['id']
-        target.save()
-        if move:
-            moved_ids = {p['id'] for p in selected}
-            source.pages = [p for p in source.pages if p['id'] not in moved_ids]
-            for pid in moved_ids:
-                source.annotations.pop(pid, None)
-            source.read_page_ids = [pid for pid in source.read_page_ids
-                                    if pid not in moved_ids]
-            if source.selected_page in moved_ids:
-                source.selected_page = source.pages[0]['id'] if source.pages else None
+        stage = Path(tempfile.mkdtemp(prefix='.yomu-transfer-', dir=target.path))
+        backup_source = stage / 'source-project.json'
+        backup_target = stage / 'target-project.json'
+        try:
+            # Create on-disk rollback manifests BEFORE changing either tab.
+            # os.replace restores them without allocating additional space,
+            # even if the transfer failed because the disk filled up.
+            shutil.copyfile(source.path / 'project.json', backup_source)
+            shutil.copyfile(target.path / 'project.json', backup_target)
+            for original in selected:
+                item = copy.deepcopy(original)
+                old_id = item['id']
+                item['id'] = short_id()
+                for field in ('source', 'render_source', 'file'):
+                    old_relative = item.get(field)
+                    if not old_relative:
+                        continue
+                    if old_relative not in mapping:
+                        rel = Path(old_relative)
+                        if rel.parts[0] not in ('originals', 'pages'):
+                            raise ValueError('Cannot transfer cached files as page sources.')
+                        origin = source.asset_path(old_relative)
+                        if not origin.is_file() or origin.is_symlink():
+                            raise ValueError(f'Source document is missing or unsafe: {old_relative}')
+                        before = origin.stat()
+                        if before.st_size > MAX_ASSET_BYTES:
+                            raise ValueError('Page source exceeds the 1 GB safety limit.')
+                        new_relative = f'{rel.parts[0]}/{short_id()}{rel.suffix.lower()}'
+                        destination = target.asset_path(new_relative)
+                        staged_file = stage / str(len(mapping))
+                        shutil.copy2(origin, staged_file)
+                        after = origin.stat()
+                        if (after.st_size != before.st_size or
+                                after.st_mtime_ns != before.st_mtime_ns or
+                                staged_file.stat().st_size != before.st_size):
+                            raise IOError('Page source changed during transfer; please retry.')
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        if destination.exists():
+                            raise FileExistsError('Destination asset already exists.')
+                        os.replace(staged_file, destination)
+                        promoted.append(destination)
+                        mapping[old_relative] = new_relative
+                    item[field] = mapping[old_relative]
+                if old_id in source.annotations:
+                    target.annotations[item['id']] = copy.deepcopy(source.annotations[old_id])
+                if move and old_id in source.read_page_ids:
+                    target.read_page_ids.append(item['id'])
+                # Transfer reading position/zoom with a MOVE. Copies begin at
+                # their own reading position, avoiding surprising shared state.
+                if move and isinstance(source.reading_view, dict):
+                    target.reading_view = (target.reading_view if
+                                           isinstance(target.reading_view, dict) else {})
+                    for field in ('positions', 'page_zooms'):
+                        original_values = source.reading_view.get(field, {})
+                        if isinstance(original_values, dict) and old_id in original_values:
+                            target.reading_view.setdefault(field, {})[item['id']] = copy.deepcopy(
+                                original_values[old_id])
+                    if old_id in source.reading_view.get('independent_pages', []):
+                        target.reading_view.setdefault('independent_pages', []).append(item['id'])
+                new_pages.append(item)
+
+            target.pages.extend(new_pages)
+            target.selected_page = new_pages[0]['id']
+            if move:
+                moved_ids = {p['id'] for p in selected}
+                source.pages = [p for p in source.pages if p['id'] not in moved_ids]
+                for pid in moved_ids:
+                    source.annotations.pop(pid, None)
+                source.read_page_ids = [pid for pid in source.read_page_ids
+                                        if pid not in moved_ids]
+                if source.selected_page in moved_ids:
+                    source.selected_page = source.pages[0]['id'] if source.pages else None
+                if isinstance(source.reading_view, dict):
+                    for field in ('positions', 'page_zooms'):
+                        if isinstance(source.reading_view.get(field), dict):
+                            for pid in moved_ids:
+                                source.reading_view[field].pop(pid, None)
+                    if isinstance(source.reading_view.get('independent_pages'), list):
+                        source.reading_view['independent_pages'] = [
+                            pid for pid in source.reading_view['independent_pages']
+                            if pid not in moved_ids]
+            # Project.save reconciles page groups before the SQLite transaction.
+            # Persist the actual sorted/reconciled model before recording Undo.
+            # Otherwise an Undo could compare an in-memory list order with
+            # the normalised read_page_ids from a subsequently loaded tab.
+            if move:
+                source.save(prune_orphan_annotations=True)
+            target.save(prune_orphan_annotations=True)
+            source_after = _page_state(self.project(source_id))
+            target_after = _page_state(self.project(target_id))
+            change = PageTransferChange(
+                self.identifier, source_id, target_id, source_before, target_before,
+                source_after, target_after,
+                tuple(path.relative_to(self.workspace).as_posix() for path in promoted),
+                bool(move),
+            )
+            self.save()  # BOTH page lists and the media become durable together.
+        except BaseException:
+            # An interrupted SQLite transaction leaves the last committed
+            # notebook intact. Restore both live manifests via rename, which
+            # also works under low-disk-space conditions.
+            try:
+                if backup_source.is_file():
+                    os.replace(backup_source, source.path / 'project.json')
+                if backup_target.is_file():
+                    os.replace(backup_target, target.path / 'project.json')
+            finally:
+                for destination in promoted:
+                    destination.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        return (len(new_pages), change) if return_change else len(new_pages)
+
+    def replay_page_transfer(self, change: PageTransferChange, *, undo: bool):
+        """One atomic cross-tab Undo/Redo, preserving unrelated notes text."""
+        if change.notebook_id != self.identifier:
+            raise ValueError('The transfer belongs to a different notebook.')
+        source = self.project(change.source_id)
+        target = self.project(change.target_id)
+        expected = (change.source_after, change.target_after) if undo else (
+            change.source_before, change.target_before)
+        desired = (change.source_before, change.target_before) if undo else (
+            change.source_after, change.target_after)
+        # Undo must not discard a more recent annotation, reading tick or
+        # navigator reorganisation from either tab. These are structural
+        # conflicts; notes text remains independent and is always preserved.
+        for project, expected_state in zip((source, target), expected):
+            if any(getattr(project, field) != expected_state[field]
+                   for field in ('pages', 'page_groups',
+                                 'annotations', 'read_page_ids')):
+                raise ValueError(
+                    'Pages or annotations changed since this transfer; '
+                    'cannot safely undo/redo it.')
+        # Redo requires the media retained in the temporary workspace. Undo
+        # deliberately keeps it there for Redo, but excludes it from the
+        # portable notebook when no living page references it.
+        if not undo:
+            for relative in change.created_assets:
+                entry = self.workspace / _safe_relative(relative, {
+                    t['id'] for t in self.tabs})
+                if not entry.is_file() or entry.is_symlink():
+                    raise IOError('Transferred page source was removed; cannot redo.')
+        stage = Path(tempfile.mkdtemp(prefix='.yomu-undo-', dir=target.path))
+        backup_source = stage / 'source-project.json'
+        backup_target = stage / 'target-project.json'
+        try:
+            shutil.copyfile(source.path / 'project.json', backup_source)
+            shutil.copyfile(target.path / 'project.json', backup_target)
+            _set_page_state(source, desired[0], expected[0])
+            _set_page_state(target, desired[1], expected[1])
             source.save()
-            # Keep transferred originals in the temporary workspace.
-            # Earlier Undo entries may still point to these files.
-            # _files() excludes them from the saved notebook when no
-            # living page references them, preventing private leftovers.
-            # Fully undoable cross-tab moves require a future history change.
-        return len(new_pages)
+            target.save()
+            self.save()
+        except BaseException:
+            if backup_source.is_file():
+                os.replace(backup_source, source.path / 'project.json')
+            if backup_target.is_file():
+                os.replace(backup_target, target.path / 'project.json')
+            raise
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     def _manifest(self):
         # App release is informational; the integer 'version' is the stable
@@ -410,21 +626,16 @@ class Notebook:
                 'tabs': self.tabs, 'active_id': self.active_id}
 
     def _files(self):
-        """Yield only materials that living pages still reference.
+        """Yield exactly the living assets and manifests (never raster caches).
 
-        A removed page may still need its original file for
-        Undo in this session. We keep that file on disk in
-        the temporary workspace, but do NOT save it inside
-        the portable notebook after the page is removed.
-
-        This distinction is important for private documents.
+        Checking each reference, instead of searching directories for files
+        that happen to exist, prevents a damaged notebook from being silently
+        saved without its source PDF/image or converted render file.
         """
         ids = {t['id'] for t in self.tabs}
         for tabid in ids:
             base = self.workspace / 'tabs' / tabid
             project = Project.load(base)
-            # Before packaging, remove old annotations for deleted pages.
-            # Standalone legacy Project.save() stays backward-compatible.
             live_page_ids = {page['id'] for page in project.pages}
             if set(project.annotations) - live_page_ids:
                 project.save(prune_orphan_annotations=True)
@@ -433,24 +644,27 @@ class Notebook:
                 for field in ('source', 'render_source', 'file')
                 if (value := page.get(field))
             }
-            for directory in ('originals', 'pages'):
-                if not (base / directory).exists():
-                    continue
-                for item in (base / directory).rglob('*'):
-                    if item.is_symlink():
-                        raise ValueError('Symbolic links cannot be stored in notebooks.')
-                    if item.is_file():
-                        asset = item.relative_to(base).as_posix()
-                        if asset not in referenced:
-                            continue
-                        relative = item.relative_to(self.workspace).as_posix()
-                        _safe_relative(relative, ids)
-                        yield relative, item
-            for name in ('project.json', 'project.v2.backup.json', 'project.v3.backup.json'):
+            for relative_source in sorted(referenced):
+                if Path(relative_source).parts[0] not in ('originals', 'pages'):
+                    raise ValueError('A live page refers to an unsupported source folder.')
+                item = base / relative_source
+                # Symlinks at any ancestor are forbidden even when they point
+                # back into the notebook workspace.
+                if (not item.is_file() or any(part.is_symlink()
+                       for part in (item, *list(item.parents)[:len(Path(relative_source).parts)]))):
+                    raise ValueError(
+                        f'Cannot save notebook: missing or unsafe page asset '
+                        f'in tab "{project.name}": {relative_source}. '
+                        'Restore the original from a backup or reimport it.')
+                rel = item.relative_to(self.workspace).as_posix()
+                _safe_relative(rel, ids)
+                yield rel, item
+            for name in ('project.json', 'project.v2.backup.json',
+                         'project.v3.backup.json'):
                 item = base / name
                 if item.exists():
-                    if item.is_symlink():
-                        raise ValueError('Symbolic links cannot be stored in notebooks.')
+                    if not item.is_file() or item.is_symlink():
+                        raise ValueError('Unsafe notebook project manifest.')
                     yield item.relative_to(self.workspace).as_posix(), item
 
     def upgrade_legacy_extension(self):
@@ -482,8 +696,65 @@ class Notebook:
         self.backup_dirty = True
         return True
 
+    def capture_save_snapshot(self):
+        """On GUI thread: freeze metadata; list assets without reading PDF bytes."""
+        import json
+        import hashlib
+        with self._save_guard.lock:
+            if self._closed:
+                raise RuntimeError('Cannot snapshot a closed notebook.')
+            self.upgrade_legacy_extension()
+            meta = self._manifest()
+            self._check_manifest(meta)
+            serial = json.dumps(meta, ensure_ascii=False, sort_keys=True)
+            files = []
+            metadata_bytes = 0
+            for relative, item in self._files():
+                fs = item.stat()
+                if fs.st_size > MAX_ASSET_BYTES:
+                    raise ValueError('A notebook asset exceeds the 1 GB safety limit.')
+                is_json = item.suffix == '.json'
+                data = item.read_bytes() if is_json else None
+                if data is not None:
+                    if len(data) > MAX_MANIFEST_BYTES:
+                        raise ValueError('A notebook metadata file is too large.')
+                    metadata_bytes += len(data)
+                    if metadata_bytes > MAX_SNAPSHOT_JSON_BYTES:
+                        from .snapshot_save import SnapshotTooLarge
+                        raise SnapshotTooLarge('Notebook metadata exceeds the safe background snapshot budget.')
+                files.append(FrozenFile(
+                    relative, item, fs.st_size, fs.st_mtime_ns, fs.st_dev,
+                    fs.st_ino, data,
+                    hashlib.sha256(data).hexdigest() if data is not None else None))
+            return SaveSnapshot(
+                self.path, serial, tuple(files), dict(self._saved_stats),
+                dict(self._saved_manifest_hashes), self._saved_manifest,
+                self._save_guard, self._save_guard.generation, self.workspace)
+
+    def accept_background_save(self, result):
+        """Called on GUI thread. Ignore stale completions after newer saves."""
+        with self._save_guard.lock:
+            if (not result.applied or self._closed or
+                    result.generation != self._save_guard.generation):
+                return False
+            self._saved_stats = result.stats
+            self._saved_manifest_hashes = result.hashes
+            self._saved_manifest = result.manifest
+            if result.changed:
+                self.backup_dirty = True
+            return True
+
     def save(self):
-        """Durable incremental commit. No PDF/page raster cache files are saved."""
+        """Synchronous safety path; serialized against background workers."""
+        with self._save_guard.lock:
+            if self._closed:
+                raise RuntimeError('Notebook has been closed.')
+            changed = self._save_synchronous()
+            self._save_guard.generation += 1
+            return changed
+
+    def _save_synchronous(self):
+        """Original incremental SQLite save, retained for explicit operations."""
         if self._closed:
             raise RuntimeError('Notebook has been closed.')
         self.upgrade_legacy_extension()
@@ -516,9 +787,14 @@ class Notebook:
                     # Hash small JSON metadata to catch same-size edits.
                     digest = (hashlib.sha256(item.read_bytes()).hexdigest()
                               if is_manifest else None)
-                    if record == self._saved_stats.get(relative) and (
-                            not is_manifest or
-                            digest == self._saved_manifest_hashes.get(relative)):
+                    if is_manifest and digest == self._saved_manifest_hashes.get(relative) \
+                            and relative in self._saved_stats:
+                        # Replacing a project.json can change its mtime without
+                        # changing its contents (e.g. rollback after a failed
+                        # transfer). Do not rewrite an identical SQLite BLOB.
+                        new_stats[relative] = record
+                        continue
+                    if not is_manifest and record == self._saved_stats.get(relative):
                         continue
                     # sqlite3.blobopen writes in bounded chunks. The old
                     # read_bytes() path would temporarily allocate up to 1 GB.
@@ -717,6 +993,10 @@ class Notebook:
             raise
 
     def close(self):
-        if not self._closed:
-            self._temporary.cleanup()
-            self._closed = True
+        # Closing must not delete source assets while a worker is reading.
+        with self._save_guard.lock:
+            if not self._closed:
+                self._save_guard.closed = True
+                self._save_guard.generation += 1
+                self._temporary.cleanup()
+                self._closed = True
