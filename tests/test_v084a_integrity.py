@@ -339,3 +339,32 @@ def test_undo_preserves_unrelated_later_reading_positions(tmp_path):
         assert source_after.reading_view['positions']['p1']['y'] == .3
     finally:
         nb.close()
+
+
+def test_transfer_resolves_workspace_alias_when_recording_created_assets(tmp_path):
+    """macOS /var alias and Windows 8.3 paths may spell the same folder differently.
+
+    A lexical path with a real '..' segment reproduces the failure without
+    requiring elevated symlink permissions on Windows CI.
+    """
+    nb, source_id, target_id = setup_pages(tmp_path)
+    try:
+        alias_segment = nb.workspace / 'alias-segment'
+        alias_segment.mkdir()
+        original_workspace = nb.workspace
+        nb.workspace = alias_segment / '..'
+        assert nb.workspace != original_workspace
+        assert nb.workspace.resolve() == original_workspace.resolve()
+
+        count, change = nb.transfer_pages(source_id, target_id, ['p1'],
+                                          move=True, return_change=True)
+        assert count == 1
+        assert len(change.created_assets) == 1
+        asset = change.created_assets[0]
+        assert asset.startswith(f'tabs/{target_id}/originals/')
+        assert (nb.workspace / asset).is_file()
+        nb.replay_page_transfer(change, undo=True)
+        assert len(nb.project(source_id).pages) == 2
+        assert len(nb.project(target_id).pages) == 0
+    finally:
+        nb.close()

@@ -547,7 +547,14 @@ class Notebook:
             change = PageTransferChange(
                 self.identifier, source_id, target_id, source_before, target_before,
                 source_after, target_after,
-                tuple(path.relative_to(self.workspace).as_posix() for path in promoted),
+                # Project.asset_path() canonicalises paths with .resolve(), but
+                # TemporaryDirectory may report an equivalent non-canonical
+                # spelling: /var vs /private/var on macOS, or 8.3 short names
+                # vs long names on Windows. Canonicalise BOTH operands before
+                # deriving relative asset paths for Undo/Redo. relative_to()
+                # still rejects a destination outside the workspace.
+                tuple(path.resolve().relative_to(self.workspace.resolve()).as_posix()
+                      for path in promoted),
                 bool(move),
             )
             self.save()  # BOTH page lists and the media become durable together.
