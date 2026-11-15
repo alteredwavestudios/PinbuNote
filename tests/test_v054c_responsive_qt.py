@@ -55,7 +55,7 @@ def test_responsive_toolbar_order_and_mode(app,tmp_path):
         pane.canvas.resize(450,600)
         pane._update_annotation_toolbar_layout()
         assert pane.annotation_mode_buttons['select'].toolButtonStyle()==Qt.ToolButtonStyle.ToolButtonIconOnly
-        assert len(pane._annotation_footer_buttons)==9
+        assert len(pane._annotation_footer_buttons)==11
         pane._theme_annotation_toolbar(window.current_palette)
         assert not pane._annotation_footer_buttons[0].icon().isNull()
     finally:
