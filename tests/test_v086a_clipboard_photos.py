@@ -28,8 +28,8 @@ def example():
 
 
 def test_version_is_current_and_release_builders_not_mislabelled():
-    assert __version__ == '0.8.7c'
-    assert 'v0.8.7c' in (ROOT / '.github/workflows/release.yml').read_text()
+    assert __version__ == '0.9.1'
+    assert 'v0.9.1' in (ROOT / '.github/workflows/release.yml').read_text()
 
 
 def test_photo_validated_portable_and_undoable():

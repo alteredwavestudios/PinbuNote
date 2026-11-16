@@ -19,6 +19,8 @@ import threading
 import shutil
 from pathlib import Path
 import time
+import hashlib
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import (Qt, QSize, QTimer, QSettings, QUrl, Signal, QPoint, QPointF, QRectF, QEvent, QSignalBlocker,
@@ -34,6 +36,7 @@ from PySide6.QtWidgets import (
     QFontComboBox, QSpinBox, QDoubleSpinBox, QSlider, QWidgetAction, QCheckBox, QColorDialog, QMenu, QSizePolicy, QFrame, QGridLayout, QStyledItemDelegate, QStyleOptionViewItem, QStackedLayout, QLineEdit, QStyle, QProgressBar, QProgressDialog, QPlainTextEdit,
 )
 from .editor import NotesEditor
+from .voice_storage import default_recordings_folder
 from .notes_layout import NotesPageSetup
 from .notes_layout_dialog import NotesPageSetupDialog
 from .platform_shortcuts import IS_MAC, PRIMARY, ALT, SHIFT, docs_shortcut
@@ -67,7 +70,7 @@ from .page_groups import (
     group_extra_vertical_scroll, page_extra_vertical_scroll,
     set_group_extra_vertical_scroll,
 )
-from .notebook import Notebook, MAX_TABS, default_backup_folder
+from .notebook import Notebook, MAX_TABS, default_backup_folder, NotebookNewerVersionError
 from .notebook_lock import NotebookInUseError, NotebookExternallyModifiedError
 from .sticky_note_dialog import StickyNoteDialog
 from .bookmark_badge import paint_bookmark_ribbon
@@ -88,6 +91,10 @@ from .tab_strip import inline_add_position
 from .ocr_engine import (MAX_REGIONS, OCR_DPI, find_tesseract, installed_languages,
                          recognise_regions, OCRCancelled)
 from .pdf_text_engine import inspect_page
+
+class CurrentNotebookSaveError(RuntimeError):
+    """Existing active notebook blocked a switch; target did not need recovery."""
+
 
 # Clipboard JPEGs are source material (not disposable preview caches).
 # Keep a single image page <= 5 MiB and one inline photo <= 320 KiB.
@@ -8108,9 +8115,14 @@ class ProjectPane(QWidget):
         try:
             self.save()
         except Exception as exc:
-            # Keep dirty state and retry without repetitive modal dialogs.
-            self.statusMessage.emit(f'Autosave could not finish: {exc}')
-            self._save_timer.start()  # retry next minute
+            # Never endlessly retry a permanent unsafe-path or disk-conflict
+            # failure; retain the unsaved editor and show a persistent warning.
+            self.statusMessage.emit(f'Autosave blocked; work retained in memory: {exc}')
+            from .notebook_lock import NotebookExternallyModifiedError
+            permanent = (isinstance(exc, NotebookExternallyModifiedError)
+                         or 'Unsafe' in str(exc) or 'unsafe' in str(exc))
+            if not permanent:
+                self._save_timer.start()  # transient write failure only
         finally:
             self._saving_from_autosave = False
 
@@ -8366,6 +8378,21 @@ class MainWindow(QMainWindow):
                 if not self.settings.contains(key) and previous.contains(key):
                     self.settings.setValue(key, previous.value(key))
             self.settings.setValue('preferencesMigrated', True)
+        # Detect interrupted sessions before cleanup or reopening notebooks.
+        # A running process holds a file lock, so it must not look like a crash.
+        try:
+            from .safe_session import interrupted_sessions
+            self._startup_interrupted_sessions = interrupted_sessions()
+        except Exception:
+            logger.exception('Could not scan interrupted working sessions')
+            self._startup_interrupted_sessions = []
+        # Only prune intentionally closed, published, backed-up sessions.
+        try:
+            from .safe_session import cleanup_fully_published_sessions
+            cleanup_fully_published_sessions()
+        except Exception:
+            logger.exception('Could not prune old published working sessions')
+        self._voice_studio = None  # no microphone opened until explicit Record
         self.theme = self.settings.value('theme', 'pinbu-quilt')
         if self.theme not in THEME_NAMES:
             self.theme = 'pinbu-quilt'
@@ -8402,6 +8429,20 @@ class MainWindow(QMainWindow):
         # Replacing it later destroys those Qt children, leaving Python with
         # deleted QLabel/QProgressBar wrappers during tab and checkbox updates.
         self.setStatusBar(QStatusBar())
+        # Plain, permanent footer text. Never confetti for an automatic save.
+        # showMessage() is temporary; permanent widgets remain visible even if
+        # the user is importing, searching, or reading another status message.
+        self._autosave_footer = QLabel('Autosave · —', self.statusBar())
+        small_font = self._autosave_footer.font()
+        if small_font.pointSizeF() > 0:
+            small_font.setPointSizeF(max(8.0, small_font.pointSizeF() - 1))
+            self._autosave_footer.setFont(small_font)
+        self._autosave_footer.setToolTip(
+            'Autosave commits changes to the private local working copy. '
+            'Use Save to publish to your chosen notebook location.')
+        self.statusBar().addPermanentWidget(self._autosave_footer)
+        self._last_secondary_backup_error = None
+        self._last_primary_backup_error = None
         # One read summary across ALL tabs.  It is derived from each
         # tab's live pages, so an empty or closed tab cannot count twice.
         self._notebook_progress_label = QLabel('Notebook: 0 / 0')
@@ -8519,7 +8560,7 @@ class MainWindow(QMainWindow):
         except AttributeError:
             pass
         self.backup_timer = QTimer(self)
-        self.backup_timer.setInterval(10 * 60 * 1000)  # rotating snapshots every 10 min
+        self.backup_timer.setInterval(5 * 60 * 1000)  # SafeSave every 5 minutes
         self.backup_timer.timeout.connect(self._periodic_backup)
         paths = ([str(initial_path)] if initial_path is not None
                  else self.settings.value('openProjects', []))
@@ -8528,15 +8569,18 @@ class MainWindow(QMainWindow):
         startup_errors = []
         for path in paths[:1]:  # one notebook with internal tabs
             try:
-                self.show_notebook(Notebook.load(Path(path)))
+                self.show_notebook(Notebook.open_session(Path(path)))
             except Exception as exc:
                 # Never quietly open an empty notebook as though nothing
                 # happened. Tell the user which file failed to load.
                 logger.exception('Could not reopen previous notebook')
                 startup_errors.append((str(path), str(exc)))
         if self.notebook is None:
-            self.show_notebook(Notebook.create(Path.home() / 'Documents' / 'Pinbu Note',
-                                               'My First Notes', extension='.pinbunote'))
+            first = Notebook.create(Path.home() / 'Documents' / 'Pinbu Note',
+                                    'My First Notes', extension='.pinbunote')
+            first_path = first.path
+            first.close()
+            self.show_notebook(Notebook.open_session(first_path))
         self.change_tab()
         if startup_errors:
             file_path, problem = startup_errors[0]
@@ -8546,6 +8590,76 @@ class MainWindow(QMainWindow):
                     f'Pinbu Note could not reopen:\n{p}\n\n{e}\n\n'
                     'The original notebook has NOT been modified.\n'
                     'Use File → Open to retry or attempt recovery.'))
+        if self._startup_interrupted_sessions:
+            QTimer.singleShot(0, self._offer_crash_recovery)
+
+    def _offer_crash_recovery(self):
+        """After an abnormal exit, offer to restore the latest LOCAL save.
+
+        Never write recovered contents over the cloud-facing original.
+        'Not now' keeps every recovery file accessible through File menu.
+        """
+        from .safe_session import (interrupted_sessions, working_root,
+                                   acknowledge_interrupted_session)
+        try:
+            current = interrupted_sessions()
+        except Exception:
+            logger.exception('Could not refresh interrupted sessions')
+            return
+        original_paths = {x['working'] for x in self._startup_interrupted_sessions}
+        candidates = [x for x in current if x['working'] in original_paths]
+        if not candidates:
+            return
+        latest = candidates[0]
+        source = Path(latest['working'])
+        original = Path(latest['original'])
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle('Pinbu Note unexpectedly closed')
+        dialog.setText('Pinbu Note unexpectedly closed. Do you wish to recover?')
+        dialog.setInformativeText(
+            f'An earlier editing session for {original.name} did not close normally.\n\n'
+            'Pinbu can restore its latest locally saved working copy as a NEW notebook. '
+            'The original notebook will not be overwritten.\n\n'
+            'You can also recover it later via File → Recover Local Working Copy…')
+        recover = dialog.addButton('Recover Latest Save', QMessageBox.ButtonRole.AcceptRole)
+        later = dialog.addButton('Not Now', QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(later)
+        dialog.exec()
+        if dialog.clickedButton() is not recover:
+            for item in candidates:
+                try:
+                    acknowledge_interrupted_session(item)
+                except Exception:
+                    logger.exception('Could not acknowledge interrupted session')
+            return
+        # Documents may be redirected into OneDrive. Recovery copies belong
+        # in OS-local application data, independently of the cloud original.
+        dest_dir = working_root().parent / 'Recovered'
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            stem = source.stem + ' Recovered'
+            target = dest_dir / (stem + '.pinbunote')
+            number = 2
+            while target.exists():
+                target = dest_dir / (f'{stem} {number}.pinbunote')
+                number += 1
+            restored = Notebook.restore_copy(source, target)
+            # Now the recovery file itself is durable. Opening can fail for a
+            # separate reason, but no recovery bytes will be deleted.
+            acknowledge_interrupted_session(latest)
+            self.open_path(restored)
+            QMessageBox.information(
+                self, 'Recovery copy created',
+                f'Restored local work to:\n{restored}\n\n'
+                'Please inspect the notebook before publishing or deleting '
+                'any older recovery files.')
+        except Exception as exc:
+            logger.exception('Startup local recovery failed')
+            QMessageBox.warning(
+                self, 'Recovery could not finish',
+                f'{exc}\n\nThe original notebook and recovery data have been retained. '
+                'You can retry from File → Recover Local Working Copy…')
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -8668,7 +8782,9 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.action('Import Older Project Folder…', self.import_legacy_project))
         file_menu.addAction(self.action('Close Project', self.close_current, QKeySequence.StandardKey.Close))
-        file_menu.addAction(self.action('Restore Backup As…', self.restore_backup))
+        file_menu.addAction(self.action('Restore From Backup…', self.restore_backup))
+        file_menu.addAction(self.action('Export Portable Backup…', self.export_portable_backup))
+        file_menu.addAction(self.action('Recover Local Working Copy…', self.recover_local_working_copy))
         file_menu.addSeparator()
         file_menu.addAction(self.action('Quit Pinbu Note', self.close,
                                         QKeySequence.StandardKey.Quit))
@@ -8694,6 +8810,7 @@ class MainWindow(QMainWindow):
         edit.addAction(self.action(f'Insert Link to Selected Page  ·  {docs_shortcut("page_link")}', lambda: self.active() and self.active().link_current_page()))
         edit.addAction(self.action('Remove Selected Pages', lambda: self.active() and self.active().remove_page()))
         edit.addAction(self.action('Focus Notes', lambda: self.active() and self.active().notes.focus_notes()))
+        edit.addAction(self.action('Voice Studio · Dictation / Lecture…', self.show_voice_studio))
         edit.addAction(self.action('Repair Notes Line Spacing…', self.repair_notes_line_spacing))
         edit.addSeparator()
         edit.addAction(self.action('Find in Notes…',
@@ -8908,6 +9025,44 @@ class MainWindow(QMainWindow):
         widget = self.tabs.currentWidget()
         return widget if isinstance(widget, ProjectPane) else None
 
+    def _warn_if_newer_original(self):
+        """Autosave remains local; alert ONCE if cloud original needs newer app.
+
+        A sleeping device can wake after Dropbox synchronised an upgraded
+        notebook. Routine autosave is never allowed to publish over it, and
+        the user needs a clear warning rather than silent background retries.
+        """
+        from .notebook_lock import disk_signature
+        from .safe_overwrite import read_destination_info
+        nb = self.notebook
+        if nb is None or not getattr(nb, '_origin_path', None):
+            return
+        signature = disk_signature(nb._origin_path)
+        if signature is None or signature == nb._origin_signature:
+            return
+        if getattr(nb, '_newer_origin_warning_signature', None) == signature:
+            return
+        try:
+            info = read_destination_info(nb._origin_path)
+            if not info.newer_application:
+                return
+            message = (f'The original notebook was saved by newer Pinbu Note '
+                       f'v{info.app_version}. Some features may not work '
+                       'correctly in your older version.\n\nWe strongly '
+                       'recommend upgrading Pinbu Note or saving a NEW copy. '
+                       'Your local autosave will continue safely, but publishing '
+                       'over the original is blocked. No original was overwritten.')
+        except NotebookNewerVersionError as exc:
+            # An unsupported future notebook format is even more dangerous.
+            message = (f'{exc}\n\nLocal autosave continues; the external '
+                       'notebook will NOT be overwritten.')
+        except (OSError, ValueError):
+            # A temporarily syncing file should not produce a false newer-
+            # version alert. Ordinary publish-signature checks still apply.
+            return
+        nb._newer_origin_warning_signature = signature
+        QMessageBox.warning(self, 'Notebook from newer Pinbu Note — update recommended', message)
+
     def _on_pane_container_save(self, pane):
         """Only idle autosaves use the worker; structural edits stay atomic."""
         notebook = self.notebook
@@ -8921,9 +9076,23 @@ class MainWindow(QMainWindow):
             return
         if (getattr(pane, '_saving_from_autosave', False)
                 and not self._changing_notebook):
+            self._warn_if_newer_original()
             self._queue_background_notebook_save((pane,))
         else:
             notebook.save()
+
+    def _set_autosave_footer(self, message=None, error=None):
+        """The discreet permanent footer indicator; no transient animation."""
+        if error:
+            self._autosave_footer.setText('Autosave · failed')
+            self._autosave_footer.setToolTip(
+                'Local autosave failed. Work may still exist only in memory. '
+                'Do not close until you have secured a recovery copy.\n' + str(error))
+        else:
+            label = message or ('Autosave · ' + datetime.now().strftime('%H:%M'))
+            self._autosave_footer.setText(label)
+            self._autosave_footer.setToolTip(
+                'Latest local working-copy save. Use Save to publish to the original notebook.')
 
     def _queue_background_notebook_save(self, panes):
         """Coalesce idle saves and never pass a Qt widget to the worker."""
@@ -8946,7 +9115,8 @@ class MainWindow(QMainWindow):
                 raise
             # Never allocate hundreds of MB merely to save in the background.
             # Rare oversized notebooks still use the proven synchronous path.
-            notebook.save()
+            if notebook.save():
+                self._set_autosave_footer()
             return
         ticket = {'notebook': notebook, 'panes': tuple(panes)}
         self._background_save_ticket = ticket
@@ -8966,14 +9136,21 @@ class MainWindow(QMainWindow):
             if notebook is not self.notebook or notebook._closed:
                 return
             if error:
-                for pane in set(ticket['panes']) | set(pending):
-                    if not pane._closed:
-                        pane.schedule_save()
+                from .notebook_lock import NotebookExternallyModifiedError
+                permanent = (isinstance(error, NotebookExternallyModifiedError)
+                             or 'Unsafe' in str(error) or 'unsafe' in str(error))
+                if not permanent:
+                    for pane in set(ticket['panes']) | set(pending):
+                        if not pane._closed:
+                            pane.schedule_save()
+                self._set_autosave_footer(error=error)
                 self.statusBar().showMessage(
-                    f'Background autosave failed; will retry: {error}', 6000)
+                    f'Autosave blocked: {error}' if permanent else
+                    f'Background autosave failed; will retry: {error}',
+                    0 if permanent else 6000)
                 return
             if notebook.accept_background_save(result) and result.changed:
-                self.statusBar().showMessage('Notebook autosaved ♡', 1600)
+                self._set_autosave_footer()
             if pending:
                 # Other panes finished their JSON snapshots during this write.
                 # Their edits must get their own *later* SQLite commit.
@@ -9011,8 +9188,12 @@ class MainWindow(QMainWindow):
                 pane.save()
                 saved.append(pane)
             self._batching_pane_saves = False
-            return notebook.save()
-        except Exception:
+            changed = notebook.save()
+            if changed:
+                self._set_autosave_footer()
+            return changed
+        except Exception as exc:
+            self._set_autosave_footer(error=exc)
             # pane.save() clears _dirty only after its manifest succeeds; the
             # enclosing SQLite transaction may still fail. A retry must not
             # silently omit those editors' recent changes.
@@ -9182,6 +9363,12 @@ class MainWindow(QMainWindow):
         but a worker may still be reading their original PDFs.  Keep both
         the widgets and workspace alive until the task completion is delivered.
         """
+        # This path is reached only after the old notebook's final snapshot
+        # was verified. Record an intentional close now rather than waiting
+        # for the deferred worker-retirement timer (which may never fire if
+        # the entire application quits immediately afterwards).
+        from .safe_session import mark_normal_close
+        mark_normal_close(notebook)
         for pane in panes:
             if pane._active:
                 pane.deactivate()
@@ -9216,8 +9403,19 @@ class MainWindow(QMainWindow):
                     pane = self.tabs.widget(i)
                     if pane._importing:
                         raise RuntimeError('Finish importing before switching projects.')
-                self._save_panes_in_one_commit(
-                    self.tabs.widget(i) for i in range(self.tabs.count()))
+                try:
+                    self._save_panes_in_one_commit(
+                        self.tabs.widget(i) for i in range(self.tabs.count()))
+                    self._backup_before_close(self.notebook)
+                except Exception as exc:
+                    if notebook is not self.notebook:
+                        notebook.close()
+                    raise CurrentNotebookSaveError(
+                        'Your CURRENT notebook could not be saved safely, so '
+                        'Pinbu has not switched notebooks.\n\n' + str(exc) +
+                        '\n\nYour target notebook is not necessarily damaged. '
+                        'Recover the missing document or restore your current '
+                        'notebook from its last verified backup.') from exc
                 for i in range(self.tabs.count()):
                     self.tabs.widget(i).deactivate()
                     self.tabs.widget(i)._closed = True
@@ -9239,11 +9437,19 @@ class MainWindow(QMainWindow):
             self._refresh_tab_buttons()
         finally:
             self._changing_notebook = False
-        self.record_recent(notebook.path)
+        self.record_recent(notebook.display_path)
         self.apply_theme()
+        if notebook._origin_path is not None:
+            self.statusBar().showMessage(
+                'Working locally · Ctrl+S / Cmd+S publishes to the original', 5500)
         self._update_notebook_progress(animate=False)
         self.change_tab()
         self.save_open_tabs()
+        self._set_autosave_footer('Autosave · ready')
+        self._last_secondary_backup_error = str(self.settings.value(
+            self._secondary_backup_error_key(notebook), '') or '') or None
+        self._last_primary_backup_error = str(self.settings.value(
+            self._primary_backup_error_key(notebook), '') or '') or None
         self.backup_timer.start()
 
     def eventFilter(self, watched, event):
@@ -9604,15 +9810,23 @@ class MainWindow(QMainWindow):
         Recovery is opt-in. Invalid annotations may be skipped,
         but the source notebook is left exactly as it was.
         """
-        if self.notebook and Path(path).expanduser().resolve() == self.notebook.path:
+        if self.notebook and Path(path).expanduser().resolve() == self.notebook.display_path:
             self.statusBar().showMessage('This notebook is already open in this window.', 3500)
             return
         try:
-            notebook = Notebook.load(Path(path))
+            notebook = Notebook.open_session(Path(path))
             self.show_notebook(notebook)
+        except CurrentNotebookSaveError as exc:
+            QMessageBox.warning(self, 'Current notebook prevented switching', str(exc))
+            return  # Do not offer recovery for the NEW notebook.
         except NotebookInUseError as exc:
             QMessageBox.warning(self, 'Notebook already open', str(exc))
             return  # Do not offer destructive/duplicate recovery for a live notebook.
+        except NotebookNewerVersionError as exc:
+            QMessageBox.warning(self, 'Notebook created by newer Pinbu Note',
+                f'{exc}\n\nThe original has NOT been changed. Update the app '
+                'before editing, and keep a separate copy for safety.')
+            return
         except Exception as exc:
             logger.exception('Could not open notebook')
             answer = QMessageBox.question(
@@ -9649,7 +9863,10 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, 'New Pinbu Note project', 'Project name:', text='New Study Project')
         if ok and name.strip():
             try:
-                notebook = Notebook.create(Path(folder), name, extension='.pinbunote')
+                created = Notebook.create(Path(folder), name, extension='.pinbunote')
+                path = created.path
+                created.close()
+                notebook = Notebook.open_session(path)
                 self.settings.setValue('lastSaveDir', folder)
                 self.show_notebook(notebook)
             except Exception as exc:
@@ -9673,18 +9890,38 @@ class MainWindow(QMainWindow):
         if pane and self.notebook:
             try:
                 changed = bool(pane._celebrate_on_next_manual_save)
-                self._save_panes_in_one_commit((pane,))
-                self.settings.setValue('lastSaveDir', str(self.notebook.path.parent))
+                self._save_panes_in_one_commit(
+                    self.tabs.widget(i) for i in range(self.tabs.count()))
+                # Only this explicit Save writes to the chosen original.
+                self.notebook.publish()
+                self.settings.setValue('lastSaveDir', str(self.notebook.display_path.parent))
+                self.settings.setValue(self._publish_health_key(),
+                                       datetime.now(timezone.utc).isoformat())
                 if changed:
                     pane._celebrate_on_next_manual_save = False
-                    self.statusBar().showMessage('Notes saved locally!', 3500)
+                    self.statusBar().showMessage('Saved locally and published to original!', 3500)
                     self.save_toast.show_for(self.root.rect())
                     self.save_confetti.celebrate(self.root.rect(),
                         str(self.settings.value('reducedMotion', 'false')).lower() == 'true')
                 else:
-                    self.statusBar().showMessage('Already saved · no new changes ♡', 2500)
+                    self.statusBar().showMessage('Saved locally and published to original ♡', 2500)
+            except NotebookNewerVersionError as exc:
+                QMessageBox.warning(self, 'Newer Pinbu version — update recommended',
+                    f'{exc}\n\nLocal edits and recovery backups are preserved. '
+                    'Please upgrade Pinbu Note, or use Save Copy As with a new filename.')
+            except NotebookExternallyModifiedError as exc:
+                QMessageBox.warning(self, 'Publishing blocked — your local copy is safe',
+                    f'{exc}\n\nPinbu has NOT replaced the external notebook. '
+                    'Use File → Save Copy As… to preserve both versions.')
             except Exception as exc:
-                QMessageBox.critical(self, 'Save failed', str(exc))
+                if 'missing or unsafe page asset' in str(exc):
+                    QMessageBox.warning(self, 'Source document missing — save blocked',
+                        f'{exc}\n\nPinbu has not published an incomplete notebook. '
+                        'Please keep the app open and restore the missing asset '
+                        'from a previous backup, or reimport its source file. '
+                        'Your original notebook has not been overwritten.')
+                else:
+                    QMessageBox.critical(self, 'Save failed', str(exc))
 
     def export_clean_notebook(self):
         """Export a privacy-cleaned copy without modifying the original.
@@ -9991,22 +10228,84 @@ class MainWindow(QMainWindow):
             self.active().choose_files()
 
     def save_copy_as(self):
+        """Save an independent copy; replace ONLY after backup + confirmation."""
         if not self.notebook:
             return
-        self._save_current_tab()
-        self.notebook.save()
-        target, _ = QFileDialog.getSaveFileName(self, 'Save project copy',
-            str(self.notebook.path.with_name(self.notebook.path.stem + ' Copy.pinbunote')),
-            'Pinbu Note Notebook (*.pinbunote *.yomunote)')
-        if target:
+        from .safe_overwrite import read_destination_info, save_copy_as as guarded_copy
+        try:
+            # Commit ALL tabs before copying, not just the active notes editor.
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count()))
+        except Exception as exc:
+            QMessageBox.warning(self, 'Cannot save copy safely', str(exc))
+            return
+        suggestion = str(self.notebook.display_path.with_name(
+            self.notebook.display_path.stem + ' Copy.pinbunote'))
+        for _ in range(10):
+            target, _ = QFileDialog.getSaveFileName(
+                self, 'Save project copy', suggestion,
+                'Pinbu Note Notebook (*.pinbunote *.yomunote)')
+            if not target:
+                return
+            dest = Path(target)
             try:
-                dest = Path(target)
+                if dest.resolve() in (self.notebook.path.resolve(),
+                                      self.notebook.display_path.resolve()):
+                    raise ValueError('This is your currently open notebook. '
+                                     'Use Save to publish to it, or choose another filename.')
+                overwrite_newer = False
                 if dest.exists():
-                    raise FileExistsError('Choose a new file name to protect your existing project.')
-                Notebook.restore_copy(self.notebook.path, dest)
-                self.open_path(dest)
+                    info = read_destination_info(dest)
+                    confirm = QMessageBox(self)
+                    confirm.setIcon(QMessageBox.Icon.Warning)
+                    confirm.setWindowTitle('Overwrite existing notebook?')
+                    if info.newer_application:
+                        confirm.setText(
+                            f'This notebook was saved by NEWER Pinbu Note v{info.app_version}.')
+                        confirm.setInformativeText(
+                            f'You are using v{__version__}. Some newer features '
+                            'and annotations may be lost if you overwrite it. '
+                            'We STRONGLY recommend saving a NEW copy instead. '
+                            'If you choose to overwrite anyway, Pinbu will '
+                            'first make and verify a local pre-overwrite backup.')
+                    else:
+                        confirm.setText('An existing notebook already has that filename.')
+                        confirm.setInformativeText(
+                            'Would you like to save as a new copy instead? '
+                            'If you overwrite, Pinbu will first make and verify '
+                            'a backup of the existing destination notebook.')
+                    new_copy = confirm.addButton('Save as New Copy', QMessageBox.ButtonRole.AcceptRole)
+                    replace = confirm.addButton('Overwrite After Backup', QMessageBox.ButtonRole.DestructiveRole)
+                    cancel = confirm.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+                    confirm.setDefaultButton(new_copy)
+                    confirm.exec()
+                    choice = confirm.clickedButton()
+                    if choice is cancel or choice not in (new_copy, replace):
+                        return
+                    if choice is new_copy:
+                        suggestion = str(dest.with_name(dest.stem + ' New Copy.pinbunote'))
+                        continue
+                    overwrite_newer = info.newer_application
+                directory = Path(str(self.settings.value(
+                    'backupDirectory', default_backup_folder())))
+                output, pre_overwrite = guarded_copy(
+                    self.notebook.path, dest, backup_directory=directory,
+                    allow_newer_application=overwrite_newer,
+                    protected_paths=(self.notebook.display_path,))
+                if pre_overwrite:
+                    QMessageBox.information(
+                        self, 'Existing notebook safely backed up',
+                        'The previous destination was preserved in its OWN '
+                        f'project backup history before overwriting.\n\n{pre_overwrite}')
+                self.open_path(output)
+                return
+            except NotebookNewerVersionError as exc:
+                QMessageBox.warning(self, 'Newer notebook — upgrade recommended',
+                                    f'{exc}\n\nPlease save a new copy instead.')
+                suggestion = str(dest.with_name(dest.stem + ' New Copy.pinbunote'))
             except Exception as exc:
-                QMessageBox.warning(self, 'Copy failed', str(exc))
+                QMessageBox.warning(self, 'Copy failed — original preserved', str(exc))
+                return
 
     def close_tab(self, index):
         if 0 <= index < self.tabs.count():
@@ -10025,6 +10324,13 @@ class MainWindow(QMainWindow):
             # active editor; one complete SQLite commit before retiring them.
             self._save_panes_in_one_commit(
                 self.tabs.widget(i) for i in range(self.tabs.count()))
+            try:
+                self._backup_before_close(self.notebook)
+            except Exception as exc:
+                QMessageBox.warning(self, 'Cannot close safely',
+                    f'Pinbu could not verify the final local backup:\n{exc}\n\n'
+                    'The notebook remains open.')
+                return
             self._changing_notebook = True
             try:
                 old = self.notebook
@@ -10042,47 +10348,366 @@ class MainWindow(QMainWindow):
             finally:
                 self._changing_notebook = False
             self.setWindowTitle('Pinbu Note')
+            self._set_autosave_footer('Autosave · —')
             self._update_notebook_progress(animate=False)
 
     def save_open_tabs(self):
-        self.settings.setValue('openProjects', [str(self.notebook.path)] if self.notebook else [])
+        self.settings.setValue('openProjects', [str(self.notebook.display_path)] if self.notebook else [])
+
+    def _publish_health_key(self):
+        path = str(self.notebook.display_path) if self.notebook else ''
+        digest = hashlib.sha256(path.encode('utf-8')).hexdigest()[:24]
+        return f'safeSave/lastPublish/{digest}'
+
+    def _secondary_backup_error_key(self, notebook):
+        digest = hashlib.sha256(str(notebook.display_path).encode('utf-8')).hexdigest()[:24]
+        return f'safeSave/lastSecondaryError/{digest}'
+
+    def _primary_backup_error_key(self, notebook):
+        digest = hashlib.sha256(str(notebook.display_path).encode('utf-8')).hexdigest()[:24]
+        return f'safeSave/lastPrimaryError/{digest}'
+
+    def _backup_destinations(self):
+        """Return primary and optional secondary roots without writing files."""
+        primary = Path(str(self.settings.value('backupDirectory', default_backup_folder()))).expanduser()
+        secondary = None
+        if str(self.settings.value('secondaryBackupEnabled', 'false')).lower() == 'true':
+            configured = str(self.settings.value('secondaryBackupDirectory', '')).strip()
+            if not configured:
+                raise ValueError('Choose a second backup folder in Preferences, or turn it off.')
+            secondary = Path(configured).expanduser()
+        from .backup_health import distinct_backup_paths
+        if secondary is not None and not distinct_backup_paths(primary, secondary):
+            raise ValueError('The second backup must be outside the primary backup folder.')
+        return primary, secondary
+
+    def _backup_to_both(self, notebook, *, force=False, reason='automatic'):
+        from .backup_health import (backup_to_destinations,
+                                    SecondaryBackupError, PrimaryBackupError)
+        primary, secondary = self._backup_destinations()
+        count = int(self.settings.value('backupCount', 100))
+        try:
+            outputs = backup_to_destinations(
+                notebook, primary, secondary, limit=count, force=force, reason=reason)
+            self._last_secondary_backup_error = None
+            self._last_primary_backup_error = None
+            self.settings.remove(self._secondary_backup_error_key(notebook))
+            self.settings.remove(self._primary_backup_error_key(notebook))
+            return outputs
+        except SecondaryBackupError as exc:
+            self._last_secondary_backup_error = str(exc)
+            self._last_primary_backup_error = None
+            self.settings.remove(self._primary_backup_error_key(notebook))
+            self.settings.setValue(self._secondary_backup_error_key(notebook), str(exc))
+            logger.warning('Secondary SafeSave backup failed: %s', exc)
+            raise
+        except PrimaryBackupError as exc:
+            self._last_primary_backup_error = str(exc)
+            self.settings.setValue(self._primary_backup_error_key(notebook), str(exc))
+            if exc.secondary_snapshot is not None:
+                self._last_secondary_backup_error = None
+                self.settings.remove(self._secondary_backup_error_key(notebook))
+            elif exc.secondary_error is not None:
+                self._last_secondary_backup_error = str(exc.secondary_error)
+                self.settings.setValue(self._secondary_backup_error_key(notebook),
+                                       self._last_secondary_backup_error)
+            logger.error('Primary SafeSave backup failed: %s', exc)
+            raise
+
+    def _backup_before_close(self, notebook):
+        """Primary close backup is required; secondary failure is disclosed."""
+        from .backup_health import SecondaryBackupError, PrimaryBackupError
+        try:
+            primary, secondary = self._backup_to_both(notebook, force=True, reason='close')
+        except PrimaryBackupError as exc:
+            if not exc.secondary_snapshot or not exc.secondary_snapshot.is_file():
+                raise IOError('The primary backup failed and no new secondary '
+                              'close snapshot could be confirmed.') from exc
+            question = QMessageBox(self)
+            question.setIcon(QMessageBox.Icon.Warning)
+            question.setWindowTitle('Primary backup folder unavailable')
+            question.setText('The PRIMARY backup failed, but the SECOND backup succeeded.')
+            question.setInformativeText(
+                str(exc.reason) + '\n\nPinbu can continue using the second '
+                'independent backup, or stay open so you can repair the primary folder.')
+            proceed = question.addButton('Continue', QMessageBox.ButtonRole.AcceptRole)
+            stay = question.addButton('Stay Open', QMessageBox.ButtonRole.RejectRole)
+            question.setDefaultButton(stay)
+            question.exec()
+            if question.clickedButton() is not proceed:
+                raise IOError('Close cancelled because the primary backup failed.') from exc
+            return exc.secondary_snapshot
+        except SecondaryBackupError as exc:
+            # The primary already exists. Never claim both succeeded. Give the
+            # user a conscious choice, not an uncloseable app or silent error.
+            if not exc.primary_snapshot or not exc.primary_snapshot.is_file():
+                raise IOError('Could not confirm the primary close backup.') from exc
+            question = QMessageBox(self)
+            question.setIcon(QMessageBox.Icon.Warning)
+            question.setWindowTitle('Second backup folder unavailable')
+            question.setText('The primary local backup succeeded, but the second backup failed.')
+            question.setInformativeText(
+                str(exc.reason) + '\n\nYour primary backup remains safe. '
+                'You can continue closing, or stay open to fix the second destination.')
+            proceed = question.addButton('Continue', QMessageBox.ButtonRole.AcceptRole)
+            stay = question.addButton('Stay Open', QMessageBox.ButtonRole.RejectRole)
+            question.setDefaultButton(stay)
+            question.exec()
+            if question.clickedButton() is not proceed:
+                raise IOError('Close cancelled because the second backup failed.') from exc
+            return exc.primary_snapshot
+        if primary is None or not primary.is_file():
+            raise IOError('Close backup was not committed. The notebook remains open.')
+        if secondary is not None and not secondary.is_file():
+            raise IOError('Second close backup was not committed.')
+        return primary
 
     def _periodic_backup(self):
-        """Every 10 min, snapshot only if changed since the previous backup."""
+        """Five-minute independent snapshots; failed secondary never reads as healthy."""
         if not self.notebook or self._exchange_busy:
-            return  # The exchange owns the notebook manifest until it finishes.
+            return
+        from .backup_health import SecondaryBackupError
         try:
-            pane = self.active()
-            if pane and pane._dirty:
-                self._save_panes_in_one_commit((pane,))
-            else:
-                self.notebook.save()
-            if self.notebook.backup_dirty:
-                directory = Path(str(self.settings.value('backupDirectory', default_backup_folder())))
-                limit = int(self.settings.value('backupCount', 30))
-                output = self.notebook.backup(directory, limit)
-                if output:
-                    self.statusBar().showMessage('Quiet recovery backup saved ♡', 2400)
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count()))
+            primary, secondary = self._backup_to_both(self.notebook, reason='automatic')
+            self._warn_if_newer_original()
+            if primary or secondary:
+                self.statusBar().showMessage('Five-minute backup completed', 2400)
+        except SecondaryBackupError as exc:
+            self._warn_if_newer_original()
+            self.statusBar().showMessage(
+                'Secondary backup FAILED — primary local backup retained. '
+                'Check Preferences → SafeSave Health.', 0)
         except Exception as exc:
-            self.statusBar().showMessage(f'Backup could not finish: {exc}', 5500)
+            self.statusBar().showMessage(f'SafeSave backup failed: {exc}', 0)
+
+    def show_backup_health(self):
+        """Non-destructive health dashboard. Full verification runs off the GUI thread."""
+        from .backup_health import inspect_store, verify_history
+        dialog = QDialog(self)
+        dialog.setWindowTitle('SafeSave Health · Pinbu Note')
+        dialog.resize(610, 470)
+        layout = QVBoxLayout(dialog)
+        explanation = QLabel(
+            'Backup Health checks both destinations separately. '
+            'Verification reads stored assets and restores a temporary notebook; '
+            'it never changes your original.')
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        report = QPlainTextEdit(dialog)
+        report.setReadOnly(True)
+        report.setPlainText('Checking backup folders…')
+        layout.addWidget(report, 1)
+        controls = QHBoxLayout()
+        refresh = QPushButton('Refresh Health')
+        verify = QPushButton('Verify Latest Backup')
+        verify_all = QPushButton('Verify Entire History…')
+        controls.addWidget(refresh)
+        controls.addWidget(verify)
+        controls.addWidget(verify_all)
+        layout.addLayout(controls)
+        done = QPushButton('Close')
+        done.clicked.connect(dialog.accept)
+        layout.addWidget(done)
+        current = self.notebook
+        if not current:
+            report.setPlainText('No notebook is open. Open a notebook to inspect its backup history.')
+            refresh.setEnabled(False)
+            verify.setEnabled(False)
+            verify_all.setEnabled(False)
+            dialog.exec()
+            return
+        try:
+            primary, secondary = self._backup_destinations()
+        except ValueError as exc:
+            report.setPlainText('Backup destination configuration error: ' + str(exc))
+            verify.setEnabled(False)
+            verify_all.setEnabled(False)
+            dialog.exec()
+            return
+        source = Path(current.display_path)
+        identity, title = current.identifier, current.name
+        working = Path(current.path)
+        published = str(self.settings.value(self._publish_health_key(), '') or '')
+        last_secondary_error = self._last_secondary_backup_error
+        last_primary_error = self._last_primary_backup_error
+        busy = False
+
+        def start(mode):
+            nonlocal busy
+            if busy:
+                return
+            busy = True
+            for btn in (refresh, verify, verify_all):
+                btn.setEnabled(False)
+            report.setPlainText('Verifying backup history in the background…'
+                                if mode != 'refresh' else 'Inspecting backup storage…')
+
+            def worker():
+                roots = [('Primary', primary)]
+                if secondary:
+                    roots.append(('Secondary', secondary))
+                stores = [(label, inspect_store(root, identity, title, source))
+                          for label, root in roots]
+                verified = []
+                if mode != 'refresh':
+                    for label, health in stores:
+                        if health.error:
+                            raise IOError(f'{label} backup directory: {health.error}')
+                        if health.marker and health.snapshot_count:
+                            result = verify_history(
+                                Path(health.marker), all_snapshots=(mode == 'all'))
+                            verified.append(f'{label}: verified {result[0]}/{result[1]} '
+                                            'snapshot(s), including a complete test restore')
+                        else:
+                            verified.append(f'{label}: no snapshots available to verify')
+                return stores, verified
+
+            def finished(result, error):
+                nonlocal busy
+                busy = False
+                if not dialog.isVisible():
+                    return
+                for btn in (refresh, verify, verify_all):
+                    btn.setEnabled(True)
+                if error:
+                    report.setPlainText(f'Backup check FAILED:\n{error}\n\n'
+                                        'No original notebook was modified.')
+                    return
+                stores, verified = result
+                lines = ['SafeSave Health · ' + title, '']
+                try:
+                    mtime = datetime.fromtimestamp(working.stat().st_mtime).astimezone()
+                    lines.append('Local working copy last modified: '
+                                 + mtime.strftime('%Y-%m-%d %H:%M:%S'))
+                except OSError:
+                    lines.append('Local working copy: unavailable')
+                lines.append('Original notebook: ' + str(source))
+                lines.append('Last successful Save to original (this Pinbu installation): '
+                             + (published or 'Not recorded'))
+                lines.append('Unpublished local changes: '
+                             + ('Yes' if current._unpublished else 'No'))
+                if last_primary_error:
+                    lines.append('Latest primary backup problem: ' + last_primary_error)
+                if last_secondary_error:
+                    lines.append('Latest secondary backup problem: ' + last_secondary_error)
+                for label, h in stores:
+                    lines += ['', label + ' backup folder: ' + h.destination]
+                    if h.error:
+                        lines.append('ERROR: ' + h.error)
+                    elif not h.marker:
+                        lines.append('No backup archive found yet')
+                    else:
+                        lines.append('Snapshots: ' + str(h.snapshot_count))
+                        lines.append('Newest snapshot: ' + (h.latest or 'None'))
+                        lines.append('Disk use: ' + f'{h.bytes_used/1048576:.1f} MiB')
+                if secondary is None:
+                    lines += ['', 'Second backup destination: Disabled (optional)']
+                if verified:
+                    lines += ['', 'Verification results:', *verified]
+                else:
+                    lines += ['', 'Integrity: Not verified in this session. '
+                              'Use one of the verification buttons.']
+                report.setPlainText('\n'.join(lines))
+
+            start_task(self, worker, finished, priority=-1)
+
+        refresh.clicked.connect(lambda: start('refresh'))
+        verify.clicked.connect(lambda: start('latest'))
+        verify_all.clicked.connect(lambda: start('all'))
+        start('refresh')
+        dialog.exec()
 
     def restore_backup(self):
+        """Restore a selected snapshot to a new, separately named notebook."""
+        from .safe_backup import list_snapshots, restore_snapshot
         folder = str(self.settings.value('backupDirectory', default_backup_folder()))
-        original, _ = QFileDialog.getOpenFileName(self, 'Select a Pinbu Note or older Yomu Note recovery backup', folder,
-                                                  'Pinbu Note Notebooks (*.pinbunote *.yomunote *.yominote)')
+        original, _ = QFileDialog.getOpenFileName(
+            self, 'Select project history.pinbubackup or portable backup', folder,
+            'Pinbu Backup Archives (*.pinbubackup);;Legacy Notebook Backups (*.pinbunote *.yomunote *.yominote)')
         if not original:
             return
-        suggested = str((self.notebook.path if self.notebook else Path(folder)/'Recovered.pinbunote')
-                         .with_name('Recovered ' + Path(original).stem + '.pinbunote'))
-        destination, _ = QFileDialog.getSaveFileName(self, 'Restore backup to a NEW project file',
-            suggested, 'Pinbu Note Notebook (*.pinbunote *.yomunote)')
-        if not destination:
-            return
         try:
-            output = Notebook.restore_copy(Path(original), Path(destination))
+            is_archive = Path(original).suffix.lower() == '.pinbubackup'
+            selected_id = None
+            if is_archive:
+                snapshots = list_snapshots(Path(original))
+                if not snapshots:
+                    raise ValueError('There are no readable snapshots in that backup.')
+                labels = [f"{item['timestamp']}  |  {item['reason']}  |  Pinbu {item['app_version']}"
+                          for item in snapshots]
+                label, accepted = QInputDialog.getItem(
+                    self, 'Select recovery version', 'Which snapshot would you like to restore?',
+                    labels, 0, False)
+                if not accepted:
+                    return
+                selected_id = snapshots[labels.index(label)]['id']
+            basename = Path(original).stem
+            suggested = str(Path.home() / 'Documents' / (basename + ' Recovered.pinbunote'))
+            destination, _ = QFileDialog.getSaveFileName(
+                self, 'Restore backup to a NEW notebook', suggested,
+                'Pinbu Note Notebook (*.pinbunote)')
+            if not destination:
+                return
+            if is_archive:
+                output = restore_snapshot(Path(original), Path(destination),
+                                          snapshot_id=selected_id)
+            else:
+                output = Notebook.restore_copy(Path(original), Path(destination))
             self.open_path(output)
         except Exception as exc:
             QMessageBox.warning(self, 'Restore failed', str(exc))
+
+    def export_portable_backup(self):
+        """Create a self-contained .pinbubackup ZIP with assets/ and data/."""
+        if not self.notebook:
+            return
+        from .safe_backup import export_portable
+        try:
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count()))
+            marker = self.notebook.safesave_backup(
+                Path(str(self.settings.value('backupDirectory', default_backup_folder()))),
+                limit=int(self.settings.value('backupCount', 100)),
+                force=True, reason='portable export')
+            suggested = str(self.notebook.display_path.with_suffix('.pinbubackup'))
+            target, _ = QFileDialog.getSaveFileName(
+                self, 'Export Portable Pinbu Backup', suggested,
+                'Pinbu Backup Archive (*.pinbubackup)')
+            if target:
+                output = export_portable(marker.parent.parent.parent, Path(target))
+                self.statusBar().showMessage(f'Portable backup exported: {output.name}', 5000)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Backup export failed', str(exc))
+
+    def recover_local_working_copy(self):
+        """Recover a retained unsynced session after crash or publish conflict."""
+        from .safe_session import recoverable_sessions
+        records = recoverable_sessions()
+        if not records:
+            QMessageBox.information(self, 'Local recovery', 'No local working copies were found.')
+            return
+        choices = [f"{Path(x['original']).name}  |  {x['opened_at']}  |  "
+                   + ('Unpublished' if x['unpublished'] else 'Saved')
+                   for x in records]
+        choice, ok = QInputDialog.getItem(
+            self, 'Recover Local Working Copy', 'Choose a retained session:',
+            choices, 0, False)
+        if not ok:
+            return
+        source = Path(records[choices.index(choice)]['working'])
+        target, _ = QFileDialog.getSaveFileName(
+            self, 'Restore as NEW notebook',
+            str(Path.home() / 'Documents' / (source.stem + ' Recovered.pinbunote')),
+            'Pinbu Note Notebook (*.pinbunote)')
+        if not target:
+            return
+        try:
+            output = Notebook.restore_copy(source, Path(target))
+            self.open_path(output)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Local recovery failed', str(exc))
 
     def _populate_theme_menu(self):
         """Group names by visual inspiration, preserving saved theme IDs."""
@@ -10146,6 +10771,41 @@ class MainWindow(QMainWindow):
         self.theme = theme
         self.settings.setValue('theme', theme)
         self.apply_theme()
+
+    def show_voice_studio(self):
+        """A modeless privacy-first recorder; does not access the microphone."""
+        studio = self._voice_studio
+        if studio is not None:
+            try:
+                studio.show()
+                studio.raise_()
+                studio.activateWindow()
+                return
+            except RuntimeError:  # native widget was deleted
+                self._voice_studio = None
+        from .voice_dialog import VoiceStudio
+        studio = VoiceStudio(self.settings, self._insert_voice_transcript, self)
+        self._voice_studio = studio
+        studio.destroyed.connect(lambda *_: setattr(self, '_voice_studio', None))
+        studio.show()
+
+    def _insert_voice_transcript(self, text):
+        """Insert into the visible note using native undo history and formatting."""
+        pane = self.active()
+        if pane is None:
+            QMessageBox.information(self, 'No notes open',
+                'Open a notebook and select a notes page to insert transcription.')
+            return
+        editor = pane.notes.editor
+        cursor = editor.textCursor()
+        cursor.beginEditBlock()
+        try:
+            cursor.insertText(str(text))
+        finally:
+            cursor.endEditBlock()
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+        pane.schedule_save()
 
     def show_preferences(self):
         """A scrollable preferences window; its Save/Cancel buttons stay visible."""
@@ -10288,9 +10948,33 @@ class MainWindow(QMainWindow):
             durations.addLayout(block)
             session_spins.append((key, spin))
         layout.addLayout(durations)
-        layout.addWidget(QLabel('Project recovery · rotating 10-minute backups'))
+        layout.addWidget(QLabel('Voice Studio · lecture recordings (stored outside notebooks)'))
+        recordings_dir = QLineEdit(str(self.settings.value(
+            'voice/recordingsFolder', '') or default_recordings_folder()))
+        recordings_dir.setToolTip('Default: OS Documents / PinbuNotes / Recordings. '
+            'Only created after you explicitly start a lecture recording.')
+        voice_folder_row = QHBoxLayout()
+        voice_folder_row.addWidget(recordings_dir, 1)
+        choose_recordings = QPushButton('Browse…')
+        def choose_recordings_folder():
+            path = QFileDialog.getExistingDirectory(
+                dialog, 'Choose lecture recording folder', recordings_dir.text())
+            if path:
+                recordings_dir.setText(path)
+        choose_recordings.clicked.connect(choose_recordings_folder)
+        voice_folder_row.addWidget(choose_recordings)
+        layout.addLayout(voice_folder_row)
+        reset_recordings = QPushButton('Restore system Documents default')
+        reset_recordings.clicked.connect(
+            lambda: recordings_dir.setText(str(default_recordings_folder())))
+        layout.addWidget(reset_recordings)
+        hint = QLabel('Lecture WAV and transcript files are kept locally, outside '
+                      'the .pinbunote file. Microphone use always requires Record and permission.')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addWidget(QLabel('SafeSave · deduplicated project histories every 5 minutes'))
         backup_dir = QLineEdit(str(self.settings.value('backupDirectory', default_backup_folder())))
-        backup_dir.setToolTip('User-writable folder for dated portable project backups (no caches).')
+        backup_dir.setToolTip('Each notebook gets its own folder with separate assets/ and data/ histories. Keep this folder on a local disk.')
         folder_row = QHBoxLayout()
         folder_row.addWidget(backup_dir, 1)
         choose_backup = QPushButton('Browse…')
@@ -10302,14 +10986,73 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(choose_backup)
         layout.addLayout(folder_row)
         backup_count = QSpinBox()
-        backup_count.setRange(1, 100)
-        backup_count.setValue(int(self.settings.value('backupCount', 30)))
-        backup_count.setToolTip('Keep at most this many dated recovery snapshots per project.')
-        layout.addWidget(QLabel('Number of backups kept per project'))
+        backup_count.setRange(20, 1000)
+        backup_count.setValue(int(self.settings.value('backupCount', 100)))
+        backup_count.setToolTip('Retain this many deduplicated snapshots for each project, including close snapshots.')
+        layout.addWidget(QLabel('Maximum historical snapshots per project (default 100)'))
         layout.addWidget(backup_count)
+        secondary_enabled = QCheckBox('Keep a second independent backup copy (optional)')
+        secondary_enabled.setChecked(
+            str(self.settings.value('secondaryBackupEnabled', 'false')).lower() == 'true')
+        secondary_enabled.setToolTip('Recommended: a different physical drive. '
+                                    'Pinbu will report a failure separately if this location is unavailable.')
+        layout.addWidget(secondary_enabled)
+        secondary_dir = QLineEdit(str(self.settings.value('secondaryBackupDirectory', '') or ''))
+        secondary_dir.setPlaceholderText('Choose a second folder, ideally on another drive')
+        secondary_dir.setEnabled(secondary_enabled.isChecked())
+        second_row = QHBoxLayout()
+        second_row.addWidget(secondary_dir, 1)
+        choose_secondary = QPushButton('Browse…')
+        choose_secondary.setEnabled(secondary_enabled.isChecked())
+        def choose_secondary_folder():
+            path = QFileDialog.getExistingDirectory(dialog, 'Choose second backup folder',
+                                                     secondary_dir.text() or str(Path.home()))
+            if path:
+                secondary_dir.setText(path)
+        choose_secondary.clicked.connect(choose_secondary_folder)
+        secondary_enabled.toggled.connect(secondary_dir.setEnabled)
+        secondary_enabled.toggled.connect(choose_secondary.setEnabled)
+        second_row.addWidget(choose_secondary)
+        layout.addLayout(second_row)
+        secondary_hint = QLabel('The primary local backup stays enabled. For protection '
+                                'against a failed drive, select a second physical drive. '
+                                'An unavailable second folder is reported, never silently ignored.')
+        secondary_hint.setWordWrap(True)
+        layout.addWidget(secondary_hint)
+        health_button = QPushButton('SafeSave Health & Verify Backups…')
+        health_button.clicked.connect(self.show_backup_health)
+        layout.addWidget(health_button)
+        migrate_backups = QPushButton('Migrate Legacy Backups…')
+        migrate_backups.setToolTip(
+            'Preview and safely convert old full-notebook backups and long-named '
+            'backup folders into readable deduplicated histories. Old copies are retained.')
+        migrate_backups.clicked.connect(self.show_backup_migration)
+        layout.addWidget(migrate_backups)
         layout.addWidget(QLabel('PDF pages are loaded on demand; caches remain disposable.'))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
+        def accept_if_backup_paths_valid():
+            if secondary_enabled.isChecked():
+                from .backup_health import distinct_backup_paths
+                destination = secondary_dir.text().strip()
+                if not destination:
+                    QMessageBox.warning(dialog, 'Choose a second folder',
+                                        'Select the second backup folder or uncheck the option.')
+                    return
+                primary_location = backup_dir.text().strip() or str(default_backup_folder())
+                if not distinct_backup_paths(primary_location, destination):
+                    QMessageBox.warning(dialog, 'Separate backup folders required',
+                                        'The second folder cannot be the primary folder, '
+                                        'or inside it (or vice versa).')
+                    return
+                second_root = Path(destination).expanduser()
+                if not second_root.is_dir() or second_root.is_symlink():
+                    QMessageBox.warning(dialog, 'Second backup folder unavailable',
+                                        'Please choose an existing folder on your '
+                                        'second drive. Pinbu must not silently '
+                                        'create a replacement folder if that drive is missing.')
+                    return
+            dialog.accept()
+        buttons.accepted.connect(accept_if_backup_paths_valid)
         buttons.rejected.connect(dialog.reject)
         outer.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -10332,8 +11075,23 @@ class MainWindow(QMainWindow):
             self.settings.setValue('readingViewPersist', persist_view.isChecked())
             self.settings.setValue('readingViewStartAtTop', start_top.isChecked())
             self._extra_scroll_action.setChecked(extra_scroll.isChecked())
-            self.settings.setValue('backupDirectory', backup_dir.text().strip() or str(default_backup_folder()))
+            chosen_recordings = recordings_dir.text().strip()
+            if not chosen_recordings:
+                chosen_recordings = str(default_recordings_folder())
+            self.settings.setValue('voice/recordingsFolder', chosen_recordings)
+            if self._voice_studio is not None:
+                self._voice_studio._mode_changed()
+            chosen_backup = backup_dir.text().strip() or str(default_backup_folder())
+            if any(part in chosen_backup.lower() for part in
+                   ('dropbox', 'onedrive', 'icloud drive', 'mobile documents', 'google drive')):
+                QMessageBox.warning(self, 'Local backup directory required',
+                                    'SafeSave backups must be stored on a local disk, outside cloud-sync folders. '
+                                    'The default system backup location will be used instead.')
+                chosen_backup = str(default_backup_folder())
+            self.settings.setValue('backupDirectory', chosen_backup)
             self.settings.setValue('backupCount', backup_count.value())
+            self.settings.setValue('secondaryBackupEnabled', secondary_enabled.isChecked())
+            self.settings.setValue('secondaryBackupDirectory', secondary_dir.text().strip())
             self.settings.setValue('focusSounds', focus_sounds.isChecked())
             self.settings.setValue('focusRepeat', focus_repeat.isChecked())
             self.settings.setValue('focusVolume', focus_volume.value())
@@ -10357,6 +11115,154 @@ class MainWindow(QMainWindow):
                 pane.notes.set_web_link_visible(web_link.isChecked())
                 pane.notes.set_jump_edit_visible(jump_edit.isChecked())
                 pane.update_preview_clarity()
+
+    def show_backup_migration(self, destination_folder=None):
+        """User-triggered, preview-first migration of old backup formats.
+
+        Large PDF imports run on a worker thread. Never delete older full-file
+        backups; long-ID project folders are preserved in a legacy archive.
+        """
+        from .backup_migration import scan_legacy_backups, migrate_legacy_backups
+
+        class BusyDialog(QDialog):
+            active = False
+            def reject(self):
+                if not self.active:
+                    super().reject()
+            def closeEvent(self, event):
+                if self.active:
+                    event.ignore()
+                else:
+                    super().closeEvent(event)
+
+        target = Path(destination_folder or str(self.settings.value(
+            'backupDirectory', default_backup_folder()))).expanduser()
+        dialog = BusyDialog(self)
+        dialog.setWindowTitle('Migrate Legacy Backups · SafeSave')
+        dialog.resize(650, 510)
+        layout = QVBoxLayout(dialog)
+        explanation = QLabel(
+            'Find older complete .pinbunote/.yomunote/.yominote backups, '
+            'early folder projects, and long-named SafeSave histories. '
+            'Imported snapshots share unchanged PDFs and images. '
+            'Old backup material is retained for recovery.')
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        layout.addWidget(QLabel('Folder to scan for older backups'))
+        source_path = QLineEdit(str(target))
+        source_row = QHBoxLayout()
+        source_row.addWidget(source_path, 1)
+        browse = QPushButton('Browse…')
+        def browse_source():
+            picked = QFileDialog.getExistingDirectory(
+                dialog, 'Select an old Pinbu/Yomu backup folder', source_path.text())
+            if picked:
+                source_path.setText(picked)
+        browse.clicked.connect(browse_source)
+        source_row.addWidget(browse)
+        layout.addLayout(source_row)
+        destination_hint = QLabel(f'New project histories are created in: {target}')
+        destination_hint.setWordWrap(True)
+        layout.addWidget(destination_hint)
+        preview = QPlainTextEdit(dialog)
+        preview.setReadOnly(True)
+        preview.setPlaceholderText('Select Scan Folder to preview legacy backups.')
+        layout.addWidget(preview, 1)
+        progress = QProgressBar(dialog)
+        progress.setVisible(False)
+        layout.addWidget(progress)
+        actions = QHBoxLayout()
+        scan = QPushButton('Scan Folder')
+        migrate = QPushButton('Migrate Found Backups…')
+        migrate.setEnabled(False)
+        close = QPushButton('Close')
+        actions.addWidget(scan)
+        actions.addWidget(migrate)
+        actions.addStretch(1)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        close.clicked.connect(dialog.reject)
+        state = {'items': []}
+
+        def do_scan():
+            migrate.setEnabled(False)
+            state['items'] = []
+            try:
+                items, issues = scan_legacy_backups(Path(source_path.text()))
+                state['items'] = items
+                rows = [f'Found {len(items)} potential legacy backups.\n']
+                for item in items[:200]:
+                    rows.append(f'[{item.kind}] {item.title} — {item.path.name}' +
+                                (f'  ⚠ {item.warning}' if item.warning else ''))
+                if len(items) > 200:
+                    rows.append(f'...plus {len(items)-200} more files.')
+                if issues:
+                    rows.append(f'\nSkipped {len(issues)} unreadable/unsupported entries:')
+                    rows.extend(issues[:30])
+                if not items and not issues:
+                    rows.append('No legacy backups found here. You can Browse to an older backup folder.')
+                rows.append('\nMigration never deletes an old full-file backup. '
+                            'Old long-named project folders are preserved under '
+                            '"_Legacy Originals (kept)" after a verified copy is made.')
+                preview.setPlainText('\n'.join(rows))
+                migrate.setEnabled(bool(items))
+            except Exception as exc:
+                preview.setPlainText(f'Could not scan backup folder: {exc}')
+        scan.clicked.connect(do_scan)
+
+        def do_migrate():
+            items = list(state['items'])
+            if not items:
+                return
+            reply = QMessageBox.question(
+                dialog, 'Convert old backups?',
+                f'Import {len(items)} old backup entries into new deduplicated '
+                'project histories?\n\n'
+                'Your old full-file backups will NOT be deleted. Previously '
+                'indexed project folders will be retained in '
+                '"_Legacy Originals (kept)" after verification.\n\n'
+                'Migration can require substantial local disk space temporarily.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            dialog.active = True
+            for button in (scan, browse, migrate, close):
+                button.setEnabled(False)
+            source_path.setReadOnly(True)
+            progress.setRange(0, 0)
+            progress.setVisible(True)
+            preview.appendPlainText('\nMigrating and verifying...')
+            def worker():
+                return migrate_legacy_backups(items, target)
+            def finished(report, error):
+                dialog.active = False
+                progress.setVisible(False)
+                for button in (scan, browse, close):
+                    button.setEnabled(True)
+                source_path.setReadOnly(False)
+                if error:
+                    preview.appendPlainText(f'\nMigration failed: {error}')
+                    QMessageBox.warning(dialog, 'Backup migration failed', str(error))
+                    return
+                preview.appendPlainText(
+                    f'\nConverted: {report.converted}  |  Already imported: '
+                    f'{report.already_imported}  |  Failed: {report.failed}')
+                if report.failures:
+                    preview.appendPlainText('\nErrors (old backups retained):\n' +
+                                            '\n'.join(report.failures[:30]))
+                QMessageBox.information(
+                    dialog, 'Backup migration finished',
+                    f'{report.converted} converted, {report.already_imported} already '
+                    f'imported, {report.failed} failed.\n\n'
+                    'Original full-file backups have been kept. Use '
+                    'File → Restore From Backup to restore a snapshot.')
+                do_scan()
+            start_task(self, worker, finished, priority=-1)
+
+        migrate.clicked.connect(do_migrate)
+        do_scan()
+        dialog.exec()
 
     def show_about(self):
         """Open a lightweight popup that dismisses on outside click or Escape."""
@@ -10395,6 +11301,12 @@ class MainWindow(QMainWindow):
         popup.show()
 
     def closeEvent(self, event):
+        if self._voice_studio is not None and self._voice_studio.isVisible():
+            self._voice_studio.close()
+            if self._voice_studio.isVisible():
+                # A user declined to stop recording/transcribing.
+                event.ignore()
+                return
         if self._exchange_busy:
             QMessageBox.information(self, 'Tab exchange active',
                                     'Finish or cancel the tab exchange before quitting.')
@@ -10408,21 +11320,51 @@ class MainWindow(QMainWindow):
             if self.notebook:
                 self._save_panes_in_one_commit(
                     self.tabs.widget(i) for i in range(self.tabs.count()))
+                self._backup_before_close(self.notebook)
+            if self.notebook and getattr(self.notebook, '_unpublished', False):
+                dialog = QMessageBox(self)
+                dialog.setIcon(QMessageBox.Icon.Question)
+                dialog.setWindowTitle('Unsaved changes')
+                dialog.setText('You have some changes you’ve made that haven’t yet been saved. '
+                               'Are you sure you wish to exit?')
+                dialog.setInformativeText(
+                    'Your work is saved locally and backed up. '
+                    'Save & Close publishes it to your chosen notebook location. '
+                    'Close Without Saving does not publish, but keeps your '
+                    'local recovery copies in case you need them later.')
+                save_close = dialog.addButton('Save & Close', QMessageBox.ButtonRole.AcceptRole)
+                discard = dialog.addButton('Close Without Saving', QMessageBox.ButtonRole.DestructiveRole)
+                go_back = dialog.addButton('Go back', QMessageBox.ButtonRole.RejectRole)
+                dialog.setDefaultButton(go_back)
+                dialog.exec()
+                choice = dialog.clickedButton()
+                if choice is go_back or choice not in (save_close, discard):
+                    event.ignore()
+                    return
+                if choice is save_close:
+                    # An exception keeps the window open and leaves the local
+                    # working copy/backup intact; never report success early.
+                    self.notebook.publish()
+                    self.settings.setValue(self._publish_health_key(),
+                                           datetime.now(timezone.utc).isoformat())
+            if self.notebook:
+                from .safe_session import mark_normal_close
+                mark_normal_close(self.notebook)
             self.save_open_tabs()
             event.accept()
+        except NotebookNewerVersionError as exc:
+            QMessageBox.warning(
+                self, 'Notebook from newer Pinbu Note — upgrade recommended',
+                f'{exc}\n\nThe original was NOT overwritten. '
+                'Use Close Without Saving to retain the local recovery copy.')
+            event.ignore()
         except NotebookExternallyModifiedError as exc:
-            answer = QMessageBox.question(
-                self, 'External changes detected — save blocked',
-                f'{exc}\n\nThe notebook on disk has NOT been overwritten.\n\n'
-                'Exit WITHOUT saving this session’s latest edits?\n'
-                'Choose No to stay open and inspect your recovery options.',
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer == QMessageBox.StandardButton.Yes:
-                self.save_open_tabs()
-                event.accept()
-            else:
-                event.ignore()
+            QMessageBox.warning(
+                self, 'Publishing blocked — local work preserved',
+                f'{exc}\n\nThe original notebook has NOT been overwritten. '
+                'Pinbu will stay open. Choose Close Without Saving to close '
+                'while keeping the local recovery files.')
+            event.ignore()
         except Exception as exc:
             QMessageBox.critical(self, 'Could not save before exit', str(exc))
             event.ignore()

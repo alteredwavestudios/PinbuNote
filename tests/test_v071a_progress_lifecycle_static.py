@@ -20,9 +20,13 @@ def test_notebook_status_bar_is_created_once_before_progress_widgets():
     installations = [node for node in calls if node.func.attr == 'setStatusBar']
     permanents = [node for node in calls if node.func.attr == 'addPermanentWidget']
     assert len(installations) == 1, 'Replacing QStatusBar destroys its permanent widgets'
-    # v0.7.2 moves the progress display into the persistent header.
-    assert len(permanents) == 0
-    assert 'header_layout.addWidget(notebook_header' in source.read_text(encoding='utf-8')
+    # Progress widgets still live in the persistent HEADER. v0.9.1 adds
+    # exactly one small autosave QLabel to the status bar, never a progress
+    # widget. Replacing the bar remains forbidden (the original Qt bug).
+    assert len(permanents) == 1
+    source_text = source.read_text(encoding='utf-8')
+    assert 'self.statusBar().addPermanentWidget(self._autosave_footer)' in source_text
+    assert 'header_layout.addWidget(notebook_header' in source_text
 
 
 def test_progress_checkbox_painter_preserves_native_hit_testing_and_theme():

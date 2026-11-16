@@ -19,6 +19,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import sys
 from contextlib import closing
 from dataclasses import dataclass
 import uuid
@@ -33,11 +34,27 @@ from .snapshot_save import (SaveGuard, FrozenFile, SaveSnapshot,
 from .notebook_lock import (NotebookLease, NotebookInUseError,
                             NotebookExternallyModifiedError, disk_signature)
 
-NOTEBOOK_VERSION = 5
+NOTEBOOK_VERSION = 6
+READABLE_NOTEBOOK_VERSIONS = (5, 6)
 MAGIC_FORMAT = 'yomu-notebook'
 MAX_TABS = 256
 MAX_ASSET_BYTES = 1024 * 1024 * 1024
 BACKUP_STORAGE_SAFETY_BYTES = 2 * 1024 * 1024 * 1024
+
+class NotebookNewerVersionError(ValueError):
+    """A future application release wrote this notebook; prevent unsafe edits."""
+
+
+def _version_sortkey(value):
+    # A tiny, dependency-free parser for release labels such as 0.9.0b.
+    match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)([a-z]?)(\d*)', str(value))
+    if match is None:
+        return None
+    a, b, c, suffix, number = match.groups()
+    # A final release sorts after its alphabetic pre-release suffix.
+    return (int(a), int(b), int(c),
+            27 if suffix == '' else ord(suffix) - ord('a') + 1,
+            int(number or 0))
 # Untrusted notebook files may lie about record counts/sizes. These are
 # generous upper limits on the TEMPORARY extraction workspace, not limits on
 # how much free space a user may have on their computer. They prevent a
@@ -205,6 +222,12 @@ class Notebook:
         self._saved_manifest = None
         self.backup_dirty = False
         self._closed = False
+        self._origin_path = None  # set only for explicit-publish local sessions
+        self._origin_lease = None
+        self._session_dir = None
+        self._session_backed_up = False
+        self._session_status = None  # active / closed; no cloud writes on close
+        self._unpublished = False
         # Acquire before the workspace is used and before any SQLite write.
         # Keep the OS handle alive for the whole editable session.
         self._lease = NotebookLease(self.path).acquire()
@@ -219,6 +242,30 @@ class Notebook:
         except BaseException:
             temporary.cleanup()
             raise
+
+    @classmethod
+    def open_session(cls, path: Path, working_base: Path | None = None):
+        """GUI entry point: isolate all autosaves from the published original."""
+        source = Path(path).expanduser().resolve()
+        if source.is_dir():
+            # Migrating a v2-v4 folder produces a NEW v5/v6 notebook alongside
+            # the old folder, then stages that notebook locally as usual.
+            migrated = cls.load(source)
+            migrated_path = migrated.path
+            migrated.close()
+            source = migrated_path
+        from .safe_session import open_working_copy
+        return open_working_copy(source, working_base)
+
+    @property
+    def display_path(self):
+        """The user-selected external notebook path, never its local cache."""
+        return self._origin_path or self.path
+
+    def publish(self):
+        """Explicit Save only: write the verified local version to its origin."""
+        from .safe_session import publish
+        return publish(self)
 
     @classmethod
     def create(cls, parent: Path, name: str, *, extension='.yomunote'):
@@ -351,9 +398,25 @@ class Notebook:
             raise ValueError('This file is not a supported Pinbu Note notebook.') from exc
 
     @staticmethod
-    def _check_manifest(meta):
-        if not isinstance(meta, dict) or meta.get('format') != MAGIC_FORMAT or meta.get('version') != NOTEBOOK_VERSION:
+    def _check_manifest(meta, *, allow_newer_app=False):
+        if not isinstance(meta, dict) or meta.get('format') != MAGIC_FORMAT:
             raise ValueError('Unsupported notebook container format.')
+        if meta.get('version') not in READABLE_NOTEBOOK_VERSIONS:
+            raise NotebookNewerVersionError(
+                f"This notebook uses format v{meta.get('version')} but this "
+                f"Pinbu Note supports up to format v{NOTEBOOK_VERSION}. Please update "
+                'the app. Do not overwrite this notebook with an older version.')
+        saved_version = _version_sortkey(meta.get('app_version'))
+        current_version = _version_sortkey(__version__)
+        if (not allow_newer_app and saved_version and current_version
+                and saved_version > current_version):
+            raise NotebookNewerVersionError(
+                f"This notebook was saved by newer Pinbu Note "
+                f"v{meta.get('app_version')} (installed: v{__version__}). "
+                'Some features or annotations may not work correctly in this older '
+                'version. We strongly recommend upgrading Pinbu Note. '
+                'The notebook has been left untouched; do not edit or autosave '
+                'over a newer-version notebook with an older app.')
         tabs = meta.get('tabs')
         if not isinstance(tabs, list) or not 1 <= len(tabs) <= MAX_TABS:
             raise ValueError('Invalid number of notebook tabs.')
@@ -670,12 +733,14 @@ class Notebook:
                 item = base / relative_source
                 # Symlinks at any ancestor are forbidden even when they point
                 # back into the notebook workspace.
-                if (not item.is_file() or any(part.is_symlink()
-                       for part in (item, *list(item.parents)[:len(Path(relative_source).parts)]))):
+                unsafe = any(part.is_symlink()
+                             for part in (item, *list(item.parents)[:len(Path(relative_source).parts)]))
+                if unsafe or not item.is_file():
+                    cause = ('unsafe symbolic link' if unsafe else 'missing file')
                     raise ValueError(
                         f'Cannot save notebook: missing or unsafe page asset '
-                        f'in tab "{project.name}": {relative_source}. '
-                        'Restore the original from a backup or reimport it.')
+                        f'in tab "{project.name}": {relative_source} '
+                        f'({cause}). Restore the original from a backup or reimport it.')
                 rel = item.relative_to(self.workspace).as_posix()
                 _safe_relative(rel, ids)
                 yield rel, item
@@ -767,6 +832,10 @@ class Notebook:
             self._saved_manifest = result.manifest
             if result.changed:
                 self.backup_dirty = True
+                if self._origin_path is not None:
+                    self._unpublished = True
+                    from .safe_session import _write_descriptor
+                    _write_descriptor(self)
             return True
 
     def save(self):
@@ -776,6 +845,10 @@ class Notebook:
                 raise RuntimeError('Notebook has been closed.')
             changed = self._save_synchronous()
             self._save_guard.generation += 1
+            if changed and self._origin_path is not None:
+                self._unpublished = True
+                from .safe_session import _write_descriptor
+                _write_descriptor(self)
             return changed
 
     def _save_synchronous(self):
@@ -868,6 +941,22 @@ class Notebook:
         if changed:
             self.backup_dirty = True
         return changed
+
+    def safesave_backup(self, directory: Path | None = None, *, limit: int = 100,
+                        force: bool = False, reason: str = 'automatic'):
+        """Deduplicated per-project snapshots; separate assets and state folders."""
+        from .safe_backup import create_snapshot, prune_snapshots
+        from .safe_session import _write_descriptor
+        self.save()  # atomic local commit before any snapshot is considered valid
+        snapshot, project_dir = create_snapshot(
+            self.path, Path(directory or default_backup_folder()),
+            force=force, reason=reason, logical_source=self.display_path)
+        if snapshot is not None:
+            prune_snapshots(project_dir, max_snapshots=limit)
+            self._session_backed_up = True
+            self.backup_dirty = False
+            _write_descriptor(self)
+        return snapshot
 
     def backup(self, directory: Path | None = None, limit: int = 30):
         """Create a consistent snapshot, retaining at most limit per notebook."""
@@ -1027,10 +1116,22 @@ class Notebook:
         # Closing must not delete source assets while a worker is reading.
         with self._save_guard.lock:
             if not self._closed:
+                if self._session_dir is not None:
+                    from .safe_session import mark_normal_close
+                    mark_normal_close(self)
                 self._save_guard.closed = True
                 self._save_guard.generation += 1
                 try:
                     self._temporary.cleanup()
                 finally:
                     self._lease.release()
+                    if self._origin_lease is not None:
+                        self._origin_lease.release()
+                        self._origin_lease = None
+                    # A staged copy is only disposable after a verified local
+                    # history snapshot AND after explicit publishing. Otherwise
+                    # it is retained for recovery after an unclean exit.
+                    if (self._session_dir is not None and self._session_backed_up
+                            and not self._unpublished):
+                        shutil.rmtree(self._session_dir, ignore_errors=True)
                     self._closed = True

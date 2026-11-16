@@ -19,7 +19,7 @@ def test_new_notebook_and_projects_record_application_release(tmp_path):
     try:
         meta = notebook_manifest(notebook.path)
         assert meta['app_version'] == __version__
-        assert meta['version'] == NOTEBOOK_VERSION == 5
+        assert meta['version'] == NOTEBOOK_VERSION == 6
         project_data = json.loads((notebook.workspace / 'tabs' /
                                    notebook.active_id / 'project.json').read_text())
         assert project_data['app_version'] == __version__
