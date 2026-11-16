@@ -39,6 +39,11 @@ LARGE_THUMB_FILE_LIMIT = 20
 LARGE_THUMB_MAX_WIDTH = 420
 ADAPTIVE_PREVIEW_MIN_LEVEL = .10
 Image.MAX_IMAGE_PIXELS = 50_000_000  # Pillow rejects extreme decompression bombs
+# Register image format plugins (notably JPEG) on the importing/main thread,
+# BEFORE Qt preview workers begin encoding. Pillow otherwise lazily imports its
+# format modules during Image.save() on a worker, which has produced an access
+# violation during Python GC in Windows CI. This has no effect on source PDFs.
+Image.init()
 _CACHE_WRITES: dict[str, int] = {}
 _CACHE_WRITE_TRACKING_LIMIT = 512  # Tracking cache folders must not grow forever across notebooks.
 _CACHE_WRITE_LOCK = threading.Lock()  # Qt workers can complete renders concurrently.

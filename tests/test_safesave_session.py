@@ -1,5 +1,6 @@
 """Local sessions never autosave onto the cloud-facing original."""
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 import pytest
 from yomunote.notebook import Notebook, NotebookNewerVersionError
@@ -74,7 +75,7 @@ def test_open_same_cloud_notebook_twice_locally_is_rejected(tmp_path):
 def test_newer_app_version_is_rejected_with_advice(tmp_path):
     nb = Notebook.create(tmp_path, 'Ahead', extension='.pinbunote')
     nb.close()
-    with sqlite3.connect(nb.path) as db:
+    with closing(sqlite3.connect(nb.path)) as db, db:
         import json
         data = json.loads(db.execute("SELECT value FROM meta WHERE key='manifest'").fetchone()[0])
         data['app_version'] = '99.0.0'
@@ -323,7 +324,7 @@ def test_open_from_previous_release_does_not_invent_unsaved_changes(tmp_path):
     original = Notebook.create(tmp_path/'cloud', 'OldRelease', extension='.pinbunote')
     path = original.path
     original.close()
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         row = db.execute("SELECT value FROM meta WHERE key='manifest'").fetchone()
         header = json.loads(row[0])
         header['app_version'] = '0.9.0b1'
@@ -348,7 +349,7 @@ def test_open_from_previous_release_does_not_invent_unsaved_changes(tmp_path):
         assert s._unpublished
         s.publish()
         assert path.read_bytes() != before
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             manifest = json.loads(db.execute("SELECT value FROM meta WHERE key='manifest'").fetchone()[0])
         assert manifest['app_version'] == '0.9.1'
     finally:

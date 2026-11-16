@@ -1,6 +1,7 @@
 """v0.9.0b3 safety tests for deliberate overwrite / newer-file handling."""
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,7 @@ def make_notebook(folder, name, text):
 
 
 def patch_version(path, *, app=None, fmt=None):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         meta = json.loads(db.execute("SELECT value FROM meta WHERE key='manifest'").fetchone()[0])
         if app is not None:
             meta['app_version'] = app
@@ -38,7 +39,7 @@ def test_overwrite_creates_verified_destination_history_and_restores_old_content
     src = make_notebook(tmp_path / 'source', 'Source', '<p>NEW notes</p>')
     dest = make_notebook(tmp_path / 'cloud', 'Destination', '<p>OLD notes</p>')
     original = dest.read_bytes()
-    with sqlite3.connect(dest) as db:
+    with closing(sqlite3.connect(dest)) as db, db:
         old_id = json.loads(db.execute(
             "SELECT value FROM meta WHERE key='manifest'").fetchone()[0])['id']
     output, snapshot = save_copy_as(src, dest, backup_directory=tmp_path/'backups')
@@ -119,13 +120,13 @@ def test_external_change_during_backup_blocks_overwrite(tmp_path, monkeypatch):
     original = mod.create_snapshot
     def mutate_destination(*args, **kwargs):
         result = original(*args, **kwargs)
-        with sqlite3.connect(dest) as db:
+        with closing(sqlite3.connect(dest)) as db, db:
             db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ('external_change','a'))
         return result
     monkeypatch.setattr(mod, 'create_snapshot', mutate_destination)
     with pytest.raises(NotebookExternallyModifiedError, match='changed'):
         save_copy_as(src, dest, backup_directory=tmp_path/'backups')
-    with sqlite3.connect(dest) as db:
+    with closing(sqlite3.connect(dest)) as db, db:
         assert db.execute("SELECT value FROM meta WHERE key='external_change'").fetchone()[0] == 'a'
 
 
@@ -181,7 +182,7 @@ def test_missing_page_asset_preoverwrite_backup_blocks_replacement(tmp_path, mon
     monkeypatch.setattr(mod, 'working_root', lambda: tmp_path/'working')
     src = make_notebook(tmp_path/'src', 'Source', '<p>new</p>')
     dest = make_notebook(tmp_path/'dest', 'Destination', '<p>old</p>')
-    with sqlite3.connect(dest) as db:
+    with closing(sqlite3.connect(dest)) as db, db:
         manifest = json.loads(db.execute("SELECT value FROM meta WHERE key='manifest'").fetchone()[0])
         tab = manifest['tabs'][0]['id']
         rel = f'tabs/{tab}/project.json'

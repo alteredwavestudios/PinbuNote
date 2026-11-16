@@ -8,7 +8,7 @@ from yomunote.window import MainWindow
 
 
 @pytest.fixture
-def window(tmp_path, monkeypatch):
+def window(tmp_path, monkeypatch, close_test_window):
     """Use a disposable notebook and INI settings, including on Windows.
 
     On Windows, QSettings defaults to the registry: HOME and XDG_CONFIG_HOME
@@ -28,14 +28,20 @@ def window(tmp_path, monkeypatch):
     settings.sync()
 
     widget = MainWindow()
-    assert widget.notebook.path == notebook_path
+    # SafeSave stages the original into an independent local working copy.
+    # The original path must remain the *display/publish* destination.
+    if widget.notebook.display_path != notebook_path:
+        widget.show_notebook(Notebook.open_session(notebook_path))
+    assert widget.notebook.display_path == notebook_path
+    assert widget.notebook.path != notebook_path
+    assert widget.notebook.path.is_file()
     assert widget.tabs.count() == 1
     widget.show()
     app.processEvents()
     try:
         yield widget
     finally:
-        widget.close()
+        close_test_window(widget)
         app.processEvents()
 
 

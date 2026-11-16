@@ -51,3 +51,33 @@ def isolate_mainwindow_user_state(request):
         return QSettings(*args, **kwargs)
 
     monkeypatch.setattr(window_module, 'QSettings', private_qsettings)
+
+
+@pytest.fixture
+def close_test_window():
+    """Close a disposable test notebook via the REAL SafeSave close dialog.
+
+    Production never auto-dismisses this dialog. The CI test schedules a
+    user-like click on Close Without Saving inside Qt's nested event loop;
+    silently disabling the dialog would weaken the tested safety contract.
+    """
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    def close(window):
+        def choose_close_without_saving():
+            for widget in QApplication.topLevelWidgets():
+                if not isinstance(widget, QMessageBox) or not widget.isVisible():
+                    continue
+                if widget.windowTitle() != 'Unsaved changes':
+                    continue
+                for button in widget.buttons():
+                    if button.text().replace('&', '') == 'Close Without Saving':
+                        button.click()
+                        return
+        QTimer.singleShot(0, choose_close_without_saving)
+        window.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+    return close
