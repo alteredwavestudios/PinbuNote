@@ -405,6 +405,30 @@ class Project:
             'splitter_sizes': self.splitter_sizes, 'panel_order': list(self.panel_order),
             'updated_at': datetime.now(timezone.utc).isoformat(),
         }
+        # A no-op save MUST NOT rewrite project.json. In particular,
+        # updated_at is not a user edit: changing it on every Save/Close made
+        # SafeSave conclude that the notebook had unpublished changes forever.
+        existing = self.path / 'project.json'
+        if existing.is_file():
+            try:
+                previous = json.loads(existing.read_text(encoding='utf-8'))
+                if isinstance(previous, dict):
+                    earlier = dict(previous)
+                    earlier.pop('updated_at', None)
+                    current = dict(data)
+                    current.pop('updated_at', None)
+                    if 'app_version' in previous:
+                        # A prior app-version stamp changing isn't an edit.
+                        # But MISSING stamps on older format projects must
+                        # still be added on the first modern save.
+                        earlier.pop('app_version', None)
+                        current.pop('app_version', None)
+                    if earlier == current:
+                        self.loaded_version = FORMAT_VERSION
+                        return
+            except (OSError, UnicodeError, ValueError, TypeError):
+                # Preserve existing safe-write behaviour on malformed files.
+                pass
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         if len(payload.encode('utf-8')) > 32 * 1024 * 1024:
             raise ValueError('Project metadata is over 32 MB. Export or split your notes before saving.')

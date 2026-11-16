@@ -1,3 +1,11 @@
+## v0.9.1 — SafeSave Health, quiet autosave footer and optional second backups
+
+- Permanent, small Autosave timestamp in the bottom status bar (no celebration).
+- Independently managed and reported optional secondary deduplicated backup location.
+- Backup Health window: timestamps, snapshot count, storage usage and verified restore tests.
+- Missing-asset errors identify the active notebook when switching to another notebook.
+- Version/installer/build workflow aligned for v0.9.1 without changing notebook v6 or backup v1.
+
 ## v0.8.6b — Sticky Notes, Bookmarks & Notebook Safety (development)
 
 - Add skeuomorphic editable sticky-note annotations with colour, fonts and

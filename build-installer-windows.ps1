@@ -1,4 +1,4 @@
-# Pinbu Note v0.8.7c - create an installer after building the app with PyInstaller.
+# Pinbu Note v0.9.1 - create an installer after building the app with PyInstaller.
 # Put this script and PinbuNote_Installer.iss in the app source folder.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -35,7 +35,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Standalone OCR verification failed; installer 
 Write-Host "Using Inno Setup compiler: $iscc"
 & $iscc $script
 if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed (exit code $LASTEXITCODE)." }
-$output = Join-Path $PSScriptRoot 'installer\PinbuNote_Setup_v0.8.7c.exe'
+$output = Join-Path $PSScriptRoot 'installer\PinbuNote_Setup_v0.9.1.exe'
 if (-not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "Compilation reported success, but output not found: $output" }
 # GitHub runs a silent installation and tests the copy users actually receive.
 # Do not open a real notebook; the app exits after a SQLite/GUI import probe.

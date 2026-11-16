@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Pinbu Note v0.8.7c - macOS .app with private, local Tesseract OCR.
+# Pinbu Note v0.9.0b - macOS .app with private, local Tesseract OCR.
 # Homebrew is a BUILD-COMPUTER dependency, not an end-user dependency.
 set -e
 cd "$(dirname "$0")"
@@ -25,7 +25,7 @@ if ! .venv/bin/python ocr_packaging/prepare_ocr.py --target macos --output .buil
   exit 1
 fi
 args=(--noconfirm --clean --windowed --onedir --name 'Pinbu Note'
-  --icon 'assets/icon.icns' --add-data 'assets:assets'
+  --icon 'assets/icon.icns' --osx-bundle-identifier 'org.pinbunote.PinbuNote' --add-data 'assets:assets'
   --add-data 'LICENSE:.' --add-data 'THIRD_PARTY_NOTICES.md:.'
   --add-binary "$PWD/.build/ocr/tesseract:ocr"
   --add-data "$PWD/.build/ocr/tessdata:ocr/tessdata")
@@ -33,6 +33,22 @@ for file in .build/ocr/*.txt .build/ocr/*.json; do
   [[ -f "$file" ]] && args+=(--add-data "$PWD/$file:ocr")
 done
 .venv/bin/python -m PyInstaller "${args[@]}" main.py
+# macOS requires this declaration before OS microphone permission can be
+# granted. It does NOT itself open or authorise microphone access.
+.venv/bin/python - <<'PYPLIST'
+from pathlib import Path
+import plistlib
+path = Path('dist/Pinbu Note.app/Contents/Info.plist')
+with path.open('rb') as stream:
+    payload = plistlib.load(stream)
+payload['NSMicrophoneUsageDescription'] = (
+    'Pinbu Note uses your microphone only when you explicitly start a Voice Studio recording.')
+with path.open('wb') as stream:
+    plistlib.dump(payload, stream)
+PYPLIST
+# Editing Info.plist invalidates the temporary PyInstaller signature. Apply
+# an ad-hoc local signature: NOT Developer ID signing or notarisation.
+codesign --force --deep --sign - 'dist/Pinbu Note.app'
 .venv/bin/python ocr_packaging/verify_ocr_bundle.py --target macos --dist "$PWD/dist/Pinbu Note.app"
 
 # A separately signed/notarized release requires the developer's Apple ID

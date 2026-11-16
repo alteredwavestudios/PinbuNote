@@ -53,3 +53,8 @@ htmlcov/
 *.bak
 *.orig
 *.rej
+
+# Pinbu SafeSave: never commit user backup histories or recoverable sessions.
+*.pinbubackup
+WorkingCopies/
+Backups/

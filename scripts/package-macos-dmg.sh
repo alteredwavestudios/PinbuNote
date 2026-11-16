@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 arch="${1:-$(uname -m)}"
-version="0.8.7c"
+version="0.9.1"
 app="$PWD/dist/Pinbu Note.app"
 [[ -d "$app" ]] || { echo "Missing built application: $app" >&2; exit 1; }
 mkdir -p release-assets
