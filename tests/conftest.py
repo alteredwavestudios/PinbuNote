@@ -75,6 +75,15 @@ def close_test_window():
             from yomunote import window as window_module
 
             class MacCIMessageBox(QMessageBox):
+                @staticmethod
+                def critical(parent, title, message, *args, **kwargs):
+                    # Diagnostic ONLY: Qt's blocking critical() dialog masks
+                    # the exception that caused MainWindow.closeEvent to fail.
+                    # Raise into pytest so the true error appears in logs.
+                    raise RuntimeError(
+                        'MAC_CI_SHUTDOWN_EXCEPTION: ' + str(title) + '\n'
+                        + str(message))
+
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **kwargs)
                     self.setOption(QMessageBox.Option.DontUseNativeDialog, True)
