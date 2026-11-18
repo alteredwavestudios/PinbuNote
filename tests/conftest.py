@@ -91,10 +91,22 @@ def close_test_window():
                         raise AssertionError(
                             'Mac CI shutdown requires exactly one '
                             'Close Without Saving button.')
-                    # Arm AFTER the dialog and its buttons have been created;
-                    # it will fire during the non-native Qt modal event loop.
-                    QTimer.singleShot(0, buttons[0].click)
-                    return super().exec()
+                    # Qt macOS offscreen cannot reliably service timers in
+                    # a nested QMessageBox.exec() event loop. Use a real,
+                    # non-native Qt dialog opened ASYNCHRONOUSLY, then click
+                    # the real button synchronously. QApplication remains
+                    # responsive, production closeEvent still checks the
+                    # clicked button, and no app safety logic is patched.
+                    button = buttons[0]
+                    self.open()
+                    button.click()
+                    if self.clickedButton() is not button:
+                        raise AssertionError(
+                            'Qt did not record the Close Without Saving click '
+                            'during macOS headless test cleanup.')
+                    print('macOS CI SafeSave test cleanup: real discard button clicked.',
+                          flush=True)
+                    return self.result()
 
             original_messagebox = window_module.QMessageBox
             window_module.QMessageBox = MacCIMessageBox
