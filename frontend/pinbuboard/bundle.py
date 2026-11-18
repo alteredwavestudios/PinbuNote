@@ -1,0 +1,27 @@
+"""Build an offline resource and retain the licences for the shipped JavaScript."""
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+root = Path(__file__).resolve().parent
+dist = root / "dist"
+compiler = shutil.which("pyside6-rcc", path=str(Path(sys.executable).parent))
+if not compiler:
+    raise SystemExit("Run using the Python environment containing PySide6.")
+files = [dist / "index.html", *sorted((dist / "assets").glob("*"))]
+if len(files) < 3 or not (dist / "THIRD_PARTY.md").is_file():
+    raise SystemExit("Run npm ci and npm run build first.")
+doc = ET.Element("RCC")
+resources = ET.SubElement(doc, "qresource", prefix="/pinbu-playable")
+for file in files:
+    ET.SubElement(resources, "file", alias=file.relative_to(dist).as_posix()).text = file.as_posix()
+with tempfile.TemporaryDirectory(dir=root) as temp:
+    src = Path(temp) / "board.qrc"
+    out = Path(temp) / "board.rcc"
+    ET.ElementTree(doc).write(src, encoding="utf-8", xml_declaration=True)
+    subprocess.run([compiler, "--binary", src, "-o", out], check=True)
+    out.replace(root / "board.rcc")
+shutil.copyfile(dist / "THIRD_PARTY.md", root / "THIRD_PARTY.md")

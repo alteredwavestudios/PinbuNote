@@ -1,5 +1,7 @@
 # PinbuBoard v1.1 engineering assessment
 
+The playable milestone now has a Windows launch guide, controls, tests and limitations. [Play the experimental draft](PLAYABLE.md)
+
 18 November 2026 · `experiment/pinbuboard-v1.1` · Pinbu Note base `afbbfcfa0f1bb007b52a6e5e936899664d1bd098`
 
 **Recommend a single board that opens on demand, using React Flow 13.0.2 and an in-memory Python model.** The two-node probe ran with both React Flow 12 and 13. Opening Chromium cost much more memory than loading the graph data. Keep the first integration read-only with respect to notebook sources. Make notebook-format work a separate milestone with its own backup and recovery tests.

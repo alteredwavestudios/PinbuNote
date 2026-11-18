@@ -58,3 +58,6 @@ htmlcov/
 *.pinbubackup
 WorkingCopies/
 Backups/
+
+# Local PinbuBoard experiment
+.pinbuboard-demo/

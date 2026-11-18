@@ -99,7 +99,18 @@ def main():
         if candidate.suffix.lower() in ('.pinbunote', '.yomunote', '.yominote'):
             initial_notebook = candidate
             break
-    window = MainWindow(initial_path=initial_notebook)
+    if '--pinbuboard-demo' in sys.argv:
+        if initial_notebook is not None:
+            raise SystemExit('The board demo opens its own disposable Study desk notebook.')
+        from yomunote.pinbuboard.window import DemoWindow
+        try:
+            window = DemoWindow(resources / '.pinbuboard-demo')
+        except (OSError, ValueError, RuntimeError) as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(None, 'Cannot open the disposable study notebook', str(exc))
+            return 1
+    else:
+        window = MainWindow(initial_path=initial_notebook)
     window.show()
     return app.exec()
 

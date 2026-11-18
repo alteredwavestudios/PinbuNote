@@ -8995,17 +8995,23 @@ class MainWindow(QMainWindow):
     visible QTabWidget. They must stay in sync after import/Undo/Redo.
     Tab Exchange is staged off-thread and committed from the GUI thread.
     """
-    def __init__(self, initial_path=None):
+    def __init__(self, initial_path=None, *, demo_root=None):
         super().__init__()
         self.setWindowTitle('Pinbu Note  ·  ピンブノート')
         self.resize(1450, 900)
         self.setMinimumSize(760, 600)
-        self.settings = (QSettings('Pinbu Note Integration Dev', 'Pinbu Note Integration Dev')
-                         if os.environ.get('YOMU_INTEGRATION_DEV') == '1'
-                         else QSettings('Pinbu Note', 'Pinbu Note'))
+        self.demo_root = demo_root
+        if demo_root is not None:
+            self.settings = QSettings(str(demo_root / 'settings.ini'), QSettings.Format.IniFormat)
+            self.settings.setValue('preferencesMigrated', True)
+            self.settings.setValue('backupDirectory', str(demo_root / 'backups'))
+        else:
+            self.settings = (QSettings('Pinbu Note Integration Dev', 'Pinbu Note Integration Dev')
+                             if os.environ.get('YOMU_INTEGRATION_DEV') == '1'
+                             else QSettings('Pinbu Note', 'Pinbu Note'))
         # One-time seed: keep legacy Yomu Note preferences READ-ONLY;
         # never import recent/open notebook paths into this test build.
-        if os.environ.get('YOMU_INTEGRATION_DEV') == '1':
+        if demo_root is None and os.environ.get('YOMU_INTEGRATION_DEV') == '1':
             from .dev_preferences import import_from_user_preferences
             import_from_user_preferences(
                 self.settings, QSettings('Yomu Note', 'Yomu Note'))
@@ -9026,14 +9032,15 @@ class MainWindow(QMainWindow):
         # A running process holds a file lock, so it must not look like a crash.
         try:
             from .safe_session import interrupted_sessions
-            self._startup_interrupted_sessions = interrupted_sessions()
+            self._startup_interrupted_sessions = interrupted_sessions() if demo_root is None else []
         except Exception:
             logger.exception('Could not scan interrupted working sessions')
             self._startup_interrupted_sessions = []
         # Only prune intentionally closed, published, backed-up sessions.
         try:
             from .safe_session import cleanup_fully_published_sessions
-            cleanup_fully_published_sessions()
+            if demo_root is None:
+                cleanup_fully_published_sessions()
         except Exception:
             logger.exception('Could not prune old published working sessions')
         self._voice_studio = None  # no microphone opened until explicit Record
@@ -9213,10 +9220,15 @@ class MainWindow(QMainWindow):
         startup_errors = []
         for path in paths[:1]:  # one notebook with internal tabs
             try:
-                self.show_notebook(Notebook.open_session(Path(path)))
+                if demo_root is not None:
+                    self.show_notebook(Notebook.open_session(Path(path), demo_root / 'working'))
+                else:
+                    self.show_notebook(Notebook.open_session(Path(path)))
             except Exception as exc:
                 # Never quietly open an empty notebook as though nothing
                 # happened. Tell the user which file failed to load.
+                if demo_root is not None:
+                    raise
                 logger.exception('Could not reopen previous notebook')
                 startup_errors.append((str(path), str(exc)))
         if self.notebook is None:

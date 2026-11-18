@@ -108,3 +108,8 @@ licensing review before publishing.
 8. Verify ownership/permissions for project artwork, jingles and screenshots.
 
 This is a practical engineering checklist, not a legal opinion or certification.
+
+## Experimental PinbuBoard frontend
+
+The opt-in source demo includes a locally compiled React Flow/React resource.
+Its versioned dependency notices ship alongside that resource. [PinbuBoard JavaScript notices](frontend/pinbuboard/THIRD_PARTY.md)
