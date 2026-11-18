@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QObject, QResource, Qt, QUrl, Slot
+from PySide6.QtCore import QFile, QDir, QObject, QResource, Qt, QUrl, Slot
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import (
     QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInterceptor,
@@ -29,11 +29,15 @@ def _resource_candidates() -> list[Path]:
 
 
 def _load_resources() -> bool:
-    if QDir(":/pinbu-playable").exists():
+    def ready() -> bool:
+        return QDir(":/pinbu-playable").exists() and QFile(":/pinbu-playable/index.html").exists()
+
+    if ready():
         return True
     for path in _resource_candidates():
-        if QResource.registerResource(str(path)) and QDir(":/pinbu-playable").exists():
+        if QResource.registerResource(str(path)) and ready():
             return True
+        QResource.unregisterResource(str(path))
     # The generated Python module uses Qt's in-process resource registration
     # API, which avoids binary RCC version differences across Qt 6 patch levels.
     for root in (SOURCE_ROOT / "frontend/pinbuboard", Path(getattr(sys, "_MEIPASS", ""))):
@@ -44,7 +48,7 @@ def _load_resources() -> bool:
             if spec and spec.loader:
                 loaded = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(loaded)
-                if QDir(":/pinbu-playable").exists():
+                if ready():
                     return True
     return False
 
