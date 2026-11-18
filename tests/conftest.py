@@ -65,18 +65,58 @@ def close_test_window():
     from PySide6.QtWidgets import QApplication, QMessageBox
 
     def close(window):
-        def choose_close_without_saving():
-            for widget in QApplication.topLevelWidgets():
-                if not isinstance(widget, QMessageBox) or not widget.isVisible():
-                    continue
-                if widget.windowTitle() != 'Unsaved changes':
-                    continue
-                for button in widget.buttons():
-                    if button.text().replace('&', '') == 'Close Without Saving':
-                        button.click()
-                        return
-        QTimer.singleShot(0, choose_close_without_saving)
-        window.close()
+        import sys
+
+        if sys.platform == 'darwin':
+            # Qt's native macOS message-box event loop can starve the Qt timer
+            # used by the original GUI cleanup. Keep the REAL production
+            # closeEvent and real QMessageBox/buttons, but make that one box
+            # non-native in this offscreen macOS TEST only.
+            from yomunote import window as window_module
+
+            class MacCIMessageBox(QMessageBox):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+
+                def exec(self):
+                    if self.windowTitle() != 'Unsaved changes':
+                        raise AssertionError(
+                            f'Unexpected modal dialog during Mac CI shutdown: '
+                            f'{self.windowTitle()!r}: {self.text()!r}')
+                    buttons = [button for button in self.buttons()
+                               if button.text().replace('&', '').strip()
+                               == 'Close Without Saving']
+                    if len(buttons) != 1:
+                        raise AssertionError(
+                            'Mac CI shutdown requires exactly one '
+                            'Close Without Saving button.')
+                    # Arm AFTER the dialog and its buttons have been created;
+                    # it will fire during the non-native Qt modal event loop.
+                    QTimer.singleShot(0, buttons[0].click)
+                    return super().exec()
+
+            original_messagebox = window_module.QMessageBox
+            window_module.QMessageBox = MacCIMessageBox
+            try:
+                window.close()
+            finally:
+                window_module.QMessageBox = original_messagebox
+        else:
+            # PROVEN Windows/Linux path: intentionally unchanged.
+            def choose_close_without_saving():
+                for widget in QApplication.topLevelWidgets():
+                    if not isinstance(widget, QMessageBox) or not widget.isVisible():
+                        continue
+                    if widget.windowTitle() != 'Unsaved changes':
+                        continue
+                    for button in widget.buttons():
+                        if button.text().replace('&', '') == 'Close Without Saving':
+                            button.click()
+                            return
+            QTimer.singleShot(0, choose_close_without_saving)
+            window.close()
+
         app = QApplication.instance()
         if app is not None:
             app.processEvents()
