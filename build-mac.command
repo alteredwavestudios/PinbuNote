@@ -26,6 +26,7 @@ if ! .venv/bin/python ocr_packaging/prepare_ocr.py --target macos --output .buil
 fi
 args=(--noconfirm --clean --windowed --onedir --name 'Pinbu Note'
   --icon 'assets/icon.icns' --osx-bundle-identifier 'org.pinbunote.PinbuNote' --add-data 'assets:assets'
+  --add-data 'frontend/pinbuboard:frontend/pinbuboard'
   --add-data 'LICENSE:.' --add-data 'THIRD_PARTY_NOTICES.md:.'
   --add-binary "$PWD/.build/ocr/tesseract:ocr"
   --add-data "$PWD/.build/ocr/tessdata:ocr/tessdata")

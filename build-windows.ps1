@@ -34,6 +34,7 @@ $pyiArgs = @('--noconfirm', '--clean', '--windowed', '--onedir',
     '--add-data', 'assets;assets',
     '--add-data', 'LICENSE;.',
     '--add-data', 'THIRD_PARTY_NOTICES.md;.',
+    '--add-data', 'frontend\pinbuboard;frontend\pinbuboard',
     '--add-binary', "$exe;ocr", 
     '--add-data', "$(Join-Path $stage 'tessdata');ocr/tessdata")
 foreach ($dll in Get-ChildItem -LiteralPath $stage -File -Filter '*.dll') {
