@@ -1,6 +1,6 @@
 name: Build draft release (Windows, macOS)
 # The source TAG is the release trigger. No binary is published automatically.
-# Windows and both macOS builds must succeed before a DRAFT release is created.
+# Windows and Apple Silicon builds must succeed before a DRAFT release is created.
 # Linux is source-only; its tests remain in ci.yml.
 on:
   push:
@@ -69,8 +69,6 @@ jobs:
         include:
           - os: macos-15
             architecture: arm64
-          - os: macos-15-intel
-            architecture: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -123,7 +121,7 @@ jobs:
           path: release-assets
           pattern: PinbuNote-*
           merge-multiple: true
-      - name: Check Windows and both macOS downloads exist
+      - name: Check Windows and Apple Silicon downloads exist
         shell: bash
         run: |
           set -euo pipefail
@@ -135,7 +133,6 @@ jobs:
           fi
           test -s "release-assets/PinbuNote_Setup_v${version}.exe"
           test -s "release-assets/PinbuNote-${version}-macOS-arm64-unsigned.dmg"
-          test -s "release-assets/PinbuNote-${version}-macOS-x86_64-unsigned.dmg"
           ( cd release-assets && sha256sum * > SHA256SUMS.txt )
       - name: Create unpublished draft with installers
         shell: bash
