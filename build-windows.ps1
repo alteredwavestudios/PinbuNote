@@ -1,4 +1,4 @@
-# Pinbu Note v0.8.7c - Windows standalone bundle with PRIVATE offline OCR.
+# Pinbu Note v1.0 - Windows standalone bundle with PRIVATE offline OCR.
 # Tesseract must be installed on this BUILD computer only, NOT on user PCs.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot

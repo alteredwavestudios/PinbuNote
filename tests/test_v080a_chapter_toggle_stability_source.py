@@ -27,4 +27,4 @@ def test_app_version_and_installer_agree():
     installer = (root / 'PinbuNote_Installer.iss').read_text()
     assert f'#define MyAppVersion "{__version__}"' in installer
     # Numeric version metadata is validated by test_v082_release_metadata.py.
-    assert f'OutputBaseFilename=PinbuNote_Setup_v{__version__}' in installer
+    assert 'OutputBaseFilename=PinbuNote_Setup_v{#MyAppVersion}' in installer

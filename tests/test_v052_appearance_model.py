@@ -106,7 +106,7 @@ def test_all_mark_types_survive_save_load_without_bumping_format(tmp_path):
     loaded = Project.load(p.path)
     assert loaded.annotations['p1'] == marks
     saved = json.loads((p.path/'project.json').read_text())
-    assert saved['version'] == FORMAT_VERSION == 4
+    assert saved['version'] == FORMAT_VERSION == 5
     assert saved['annotations']['p1'] == marks
 
 

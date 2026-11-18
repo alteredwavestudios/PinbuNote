@@ -18,7 +18,7 @@ def test_all_six_layouts_are_portable_and_keep_their_widths():
             loaded = Project.load(project.path)
             assert loaded.panel_order == list(order)
             assert loaded.splitter_sizes == [180, 530, 460]
-            assert loaded.loaded_version == 4
+            assert loaded.loaded_version == 5
 
 
 def test_old_v4_manifest_defaults_to_classic_layout():

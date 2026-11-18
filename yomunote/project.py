@@ -1,6 +1,9 @@
-"""Versioned, portable Yomu Note project files with restricted asset paths.
+"""Portable per-tab project manifests with restricted asset paths.
 
-Version 4 reads v2/v3 Sumi Study manifests and migrates them on save. Version 1 is unsupported.
+Project format v5 adds sparse research metadata (references, tags, page numbering).
+Older v2/v3/v4 projects remain readable and upgrade on save; version 1 is not.
+One tab's project.json stays INSIDE the notebook SQLite container, so existing
+SafeSave and tab-sharing code keep all research data without a sidecar file.
 """
 from __future__ import annotations
 import json
@@ -17,9 +20,10 @@ from .vector_marks import valid_stroke, valid_shape, valid_highlight, valid_phot
 from .notes_layout import NotesPageSetup
 from .page_groups import validate as validate_page_groups, flat_tree, reconcile
 from .reading_progress import validated_read_ids
+from .research import empty_research, validate_research
 from .reading_view import clean_reading_view
 
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 PANEL_KEYS = ('pages', 'preview', 'notes')
 
 
@@ -152,6 +156,8 @@ class Project:
     highlight_color: str = '#FFE536'
     # Cosmetic per-page reading position and root-group zoom state.
     reading_view: dict = field(default_factory=dict)
+    # v0.9.2a: compact per-tab research metadata, stored in project.json.
+    research: dict = field(default_factory=empty_research)
     loaded_version: int = field(default=FORMAT_VERSION, repr=False)
 
     @classmethod
@@ -184,7 +190,7 @@ class Project:
         if data.get('format') not in ('sumi-study', 'yomu-note'):
             raise ValueError('This is not a supported Yomu Note project.')
         version = data.get('version')
-        if version not in (2, 3, FORMAT_VERSION):
+        if version not in (2, 3, 4, FORMAT_VERSION):
             raise ValueError(f'Project format v{version} is not supported. Supported versions: 2–{FORMAT_VERSION}.')
         annotations = data.get('annotations', {}) if version >= 3 else {}
         # If a saved notebook predates the highlight_color field, preserve the
@@ -342,7 +348,9 @@ class Project:
                    selected_page=selected_page,
                    splitter_sizes=sizes, panel_order=list(order),
                    identifier=data.get('id') if isinstance(data.get('id'), str) else short_id(),
-                   annotations=annotations, highlight_color=highlight_color, loaded_version=version)
+                   annotations=annotations, highlight_color=highlight_color,
+                   research=validate_research(data.get('research')),
+                   loaded_version=version)
 
     def save(self, *, prune_orphan_annotations: bool = False) -> None:
         if not valid_panel_order(self.panel_order):
@@ -354,8 +362,8 @@ class Project:
                 raise ValueError('Invalid page bookmark.')
         self.path.mkdir(parents=True, exist_ok=True)
         # Verify every live page is represented exactly once before saving.
-        # Keep the existing project format number: this is an optional
-        # navigator field which older readers can safely ignore.
+        # Validate the existing hierarchy before serialising research targets.
+        # The v5 format bump protects references against lossy older readers.
         if self.page_groups is None:
             self.page_groups = flat_tree([page['id'] for page in self.pages])
         self.page_groups = reconcile(
@@ -384,6 +392,7 @@ class Project:
             'app_version': __version__,  # app release, not project schema
             'id': self.identifier, 'name': self.name, 'pages': self.pages,
             'page_groups': self.page_groups,
+            'research': validate_research(self.research),
             'reading_view': clean_reading_view(
                 self.reading_view, self.pages, self.page_groups),
             # Session Undo may still reference removed pages.  Save only
@@ -405,6 +414,30 @@ class Project:
             'splitter_sizes': self.splitter_sizes, 'panel_order': list(self.panel_order),
             'updated_at': datetime.now(timezone.utc).isoformat(),
         }
+        # A no-op save MUST NOT rewrite project.json. In particular,
+        # updated_at is not a user edit: changing it on every Save/Close made
+        # SafeSave conclude that the notebook had unpublished changes forever.
+        existing = self.path / 'project.json'
+        if existing.is_file():
+            try:
+                previous = json.loads(existing.read_text(encoding='utf-8'))
+                if isinstance(previous, dict):
+                    earlier = dict(previous)
+                    earlier.pop('updated_at', None)
+                    current = dict(data)
+                    current.pop('updated_at', None)
+                    if 'app_version' in previous:
+                        # A prior app-version stamp changing isn't an edit.
+                        # But MISSING stamps on older format projects must
+                        # still be added on the first modern save.
+                        earlier.pop('app_version', None)
+                        current.pop('app_version', None)
+                    if earlier == current:
+                        self.loaded_version = FORMAT_VERSION
+                        return
+            except (OSError, UnicodeError, ValueError, TypeError):
+                # Preserve existing safe-write behaviour on malformed files.
+                pass
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         if len(payload.encode('utf-8')) > 32 * 1024 * 1024:
             raise ValueError('Project metadata is over 32 MB. Export or split your notes before saving.')

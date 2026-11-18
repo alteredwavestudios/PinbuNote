@@ -25,7 +25,7 @@ import uuid
 
 from . import __version__
 from .notebook import (Notebook, MAX_ASSET_BYTES, MAX_TABS, MAGIC_FORMAT,
-                       NOTEBOOK_VERSION, _safe_relative)
+                       NOTEBOOK_VERSION, _safe_relative, read_bounded_manifest)
 from .project import Project, FORMAT_VERSION, validate_relpath, short_id, safe_name
 
 MAX_TRANSFER_BYTES = 4 * 1024 * 1024 * 1024  # guard against huge untrusted shares
@@ -69,15 +69,7 @@ def _manifest(conn):
     its contents to Python. This matters because shared files are untrusted.
     """
     try:
-        metadata_size = conn.execute(
-            'SELECT length(value) FROM meta WHERE key=?', ('manifest',)
-        ).fetchone()
-        if not metadata_size or type(metadata_size[0]) is not int or not 0 < metadata_size[0] <= MANIFEST_MAX:
-            raise ValueError('Shared notebook has no valid manifest.')
-        row = conn.execute('SELECT value FROM meta WHERE key=?', ('manifest',)).fetchone()
-        if not row or not isinstance(row[0], str) or len(row[0]) > MANIFEST_MAX:
-            raise ValueError('Shared notebook has no valid manifest.')
-        meta = json.loads(row[0])
+        meta = read_bounded_manifest(conn)
         Notebook._check_manifest(meta)
         return meta
     except (sqlite3.DatabaseError, json.JSONDecodeError, TypeError) as exc:

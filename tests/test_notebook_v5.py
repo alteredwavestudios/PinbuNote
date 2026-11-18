@@ -38,7 +38,7 @@ def test_single_file_tabs_are_independent_and_reopen(tmp_path):
         assert reloaded.project(original_id).notes_scroll == 310
         assert reloaded.project(original_id).asset_path('originals/slides.png').read_bytes() == b'pretend image source'
         assert reloaded.project(second_id).notes_html.startswith('<p>A different reading')
-        assert NOTEBOOK_VERSION == 5
+        assert NOTEBOOK_VERSION == 7
     finally:
         reloaded.close()
 

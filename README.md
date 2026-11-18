@@ -1,15 +1,93 @@
-Pinbu Note ♥
-ピンブノート
 
-Little pieces, big ideas.
+# Pinbu Note ♥ — v1.0
 
-A cosy, offline study companion for Windows and macOS. Organise your readings, annotate documents, collect notes and stitch your ideas together.
+**Offline reading, annotating and study notes, inspired by patchwork.**
 
-Current version: v0.8.7c
+This v1.0 source release candidate builds on v0.96 with optional preview-only Smart Dark and Invert reading modes. **The unsuccessful v0.97 annotation-to-notes linking feature and its UI have been removed**, along with all PinbuBoard experiments. Notebook format remains v7 / project manifest v5.
 
-Highlights: Three-column workspace, PDF and document importing, OCR, rich-text notes, movable sticky notes, bookmarks, reading progress, Pomodoro, notebook exchange, custom themes and flexible page scrolling.
+The v0.95 security hardening, v0.96 citation contrast fixes, Windows/Linux fullscreen, reference-based display labels, minimal themes and F1 shortcuts Help window are included. See `START-HERE-v1.0.md`, `RELEASE_NOTES_v1.0.md` and `V100_FINAL_AUDIT.md`. **Use copied notebooks for first testing.** Native Windows/macOS installers and real GUI acceptance tests remain separate release gates.
 
-Theme collections: Japanese & Kawaii, Pinbu Textiles, French Art Nouveau, Modern & System.
+## Research navigator (introduced in v0.9.2b)
+
+In both Groups and Individual navigation, **click the small page-number badge**
+to cycle through printed/bibliographic, original PDF or slide, and tree-order
+numbers. Hover to learn the current number mode; directly assigned references
+show ◆, inherited references ◇. A right-click offers a direct mode menu.
+Under Settings → Preferences, configure the default number, optional author/
+tag/title detail, and full bibliography tooltips. **Only compact per-page
+display overrides live in QSettings, never in the SQLite research metadata.**
+The notebook container stays v7 and project manifest v5.
+
+## Research v0.9.2a — navigator-first references & tags
+
+The Groups navigator can now assign **Cite Them Right Harvard** reference
+records to groups, chapters and pages; copy formatted in-text/bibliography
+entries as rich HTML + plain text; apply searchable research tags and bulk
+printed-page offsets (Arabic/Roman). Page/group reorganisation retains
+references and tags. See `START-HERE-v0.9.2a.md` and
+`RELEASE_NOTES_v0.9.2a.md` for details and limitations.
+
+**IMPORTANT:** New notebook format **v7** / project format **v5**. Older
+v0.9.1 builds cannot edit these files. Test with **copies** of study notebooks.
+
+## SafeSave v0.9.1 — Health, quiet autosave footer & optional second backup
+
+The permanent status-bar footer shows a small `Autosave · HH:MM` time after
+local saving. Preferences now includes an *optional* independent second backup
+folder, a **SafeSave Health & Verify Backups…** window and detailed last-backup
+status per location. The new health check can hash-check snapshots and perform
+a real temporary restore without touching the original notebook. Primary
+backups remain mandatory. See `RELEASE_NOTES_v0.9.1.md` and
+`START-HERE-v0.9.1.md` for testing guidance.
+
+## SafeSave fundamentals (experimental)
+
+By default, GUI-opened notebooks run from a private OS-local SQLite working copy.
+Autosaves and five-minute backups never write directly to Dropbox/OneDrive/iCloud.
+**File → Save** deliberately publishes a checked copy back to the selected
+original; a changed original blocks publishing and keeps the working copy.
+On close, a fresh, immutable snapshot is created in a local
+per-project history, preserving unpublished working copies for recovery.
+
+`Backups/<Readable Project Name>/` contains `assets/` (content-addressed
+PDFs/images) and `data/` (compressed metadata objects and versioned snapshots),
+with a `history.pinbubackup` index for **File → Restore From Backup…**.
+**File → Export Portable Backup…** generates a standalone `.pinbubackup` file
+containing both folders; restore creates a separate `.pinbunote` file.
+
+Notebook format v7 is written by this build; it can still read v5/v6 notebooks.
+Older Pinbu/Yomu Note builds reject newer formats rather than overwrite them.
+Do not downgrade an edited v7 notebook.
+
+**Important limitation:** cloud-folder publishing relies on file revision
+checks; it is not an atomic Dropbox/OneDrive conditional write. Simultaneous
+publishes from devices that have not yet synced can still produce conflicts.
+Keep recovery backups, use a disposable test notebook first, and allow cloud
+sync to finish before editing from another machine.
+
+**v0.9.0b4:** Save Copy As can explicitly overwrite an existing notebook, but first makes a deduplicated, independently verified **pre-overwrite** snapshot of the **destination's own project history**. Newer app versions trigger a prominent Save as New Copy recommendation; incompatible future notebook formats are protected from overwrite. The cloud original is not targeted by autosave; if it changes to a newer app version while open, Pinbu warns without publishing. See `RELEASE_NOTES_v0.9.0b4.md`.
+
+## Experimental Voice Studio (v0.9.0a)
+
+Edit → Voice Studio opens **Dictation** or **Lecture** mode. Mic access starts
+only after clicking Record or Resume, confirming Pinbu's consent prompt and
+granting OS permission. Pause and Stop release the microphone immediately.
+
+- Lecture recordings and transcripts live **outside** notebooks, by default
+  in your OS Documents folder at `PinbuNotes/Recordings` (Windows, macOS and
+  Linux XDG Documents locations). Change this in Preferences → Voice Studio.
+- Dictation audio is temporary and deleted when Voice Studio closes; recognised
+  text can be inserted into the current notes at the cursor.
+- Transcription is entirely **offline** using a user-supplied `whisper-cli`
+  (whisper.cpp executable) and local `ggml-*.bin` model. Neither is bundled
+  in this experimental source/installer: configure both paths in Voice Studio.
+  Without them recording still works, but transcription does not.
+- Lecture transcription begins **after Stop**, not during recording, in
+  one-minute chunks, with coarse timestamps saved beside the WAV file. Partial
+  transcripts are checkpointed on disk; the original WAV is retained.
+- An explicit GUI smoke test is still required on Windows and macOS for OS
+  microphone permissions, device format fallback, transcript insertion and
+  long recording recovery. Do not publish as a stable feature yet.
 
 ## What's new
 

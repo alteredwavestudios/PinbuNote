@@ -1,13 +1,13 @@
-"""Yomu Note v5 notebook container: one portable, incremental SQLite file.
+"""Pinbu Note v7 notebook container: one portable, incremental SQLite file.
 
-Each tab uses an ordinary v4 Project in a temporary working directory. PDF
+Each tab uses an ordinary v5 Project in a temporary working directory. PDF
 raster caches never enter the container or its backup snapshots. Only altered
 source files/manifests are written to SQLite on each debounce save, so saving
 huge PDFs does NOT require re-zipping the entire notebook.
 
 The on-disk format is deliberately distinct from legacy v2-v4 .yominote
-DIRECTORIES. Opening a legacy directory creates a new v5 FILE alongside it;
-legacy sources are never overwritten or deleted.
+DIRECTORIES. Opening a legacy directory creates a new portable FILE alongside
+it; legacy sources are never overwritten or deleted.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import sys
 from contextlib import closing
 from dataclasses import dataclass
 import uuid
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
+from .research import effective_reference, effective_tags, effective_page_label
 from .project import Project, safe_name, unique_project_path, short_id
 from .reading_view import clean_reading_view
 from .snapshot_save import (SaveGuard, FrozenFile, SaveSnapshot,
@@ -33,11 +35,28 @@ from .snapshot_save import (SaveGuard, FrozenFile, SaveSnapshot,
 from .notebook_lock import (NotebookLease, NotebookInUseError,
                             NotebookExternallyModifiedError, disk_signature)
 
-NOTEBOOK_VERSION = 5
+NOTEBOOK_VERSION = 7
+READABLE_NOTEBOOK_VERSIONS = (5, 6, 7)
 MAGIC_FORMAT = 'yomu-notebook'
 MAX_TABS = 256
 MAX_ASSET_BYTES = 1024 * 1024 * 1024
 BACKUP_STORAGE_SAFETY_BYTES = 2 * 1024 * 1024 * 1024
+
+class NotebookNewerVersionError(ValueError):
+    """A future application release wrote this notebook; prevent unsafe edits."""
+
+
+def _version_sortkey(value):
+    # Both 0.95 (our stability release) and historical 0.9.2b are valid.
+    # The second number is a *number*, not a decimal fraction: 0.95 > 0.9.2b.
+    # Always return five comparable integers, including for pre-release names.
+    match = re.fullmatch(r'(\d+)\.(\d+)(?:\.(\d+))?([a-z]?)(\d*)', str(value))
+    if match is None:
+        return None
+    a, b, c, suffix, number = match.groups()
+    return (int(a), int(b), int(c or 0),
+            27 if suffix == '' else ord(suffix) - ord('a') + 1,
+            int(number or 0))
 # Untrusted notebook files may lie about record counts/sizes. These are
 # generous upper limits on the TEMPORARY extraction workspace, not limits on
 # how much free space a user may have on their computer. They prevent a
@@ -45,6 +64,38 @@ BACKUP_STORAGE_SAFETY_BYTES = 2 * 1024 * 1024 * 1024
 MAX_LOADED_FILES = 200_000
 MAX_LOADED_BYTES = 32 * 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
+
+
+def read_bounded_manifest(conn):
+    """Read the top-level notebook metadata without loading huge hostile data.
+
+    A .pinbunote is just SQLite and might originate outside this app. Reading
+    ``SELECT value`` first gives SQLite permission to transfer an arbitrarily
+    large string into Python before our validator ever sees it. Even JSON
+    rejected immediately afterwards can waste a surprising amount of memory.
+
+    Instead, ask SQLite to measure the *UTF-8 byte length* and return the value
+    only when it fits. The CASE expression also makes the decision and fetch
+    part of one statement, so a concurrent database edit cannot change the row
+    between two separate queries. We intentionally don't validate the app
+    version here: some callers must inspect newer notebooks without editing.
+    """
+    row = conn.execute(
+        "SELECT CASE WHEN typeof(value) = 'text' "
+        "AND length(CAST(value AS BLOB)) BETWEEN 1 AND ? "
+        "THEN value ELSE NULL END "
+        "FROM meta WHERE key=?",
+        (MAX_MANIFEST_BYTES, 'manifest'),
+    ).fetchone()
+    if row is None or not isinstance(row[0], str):
+        raise ValueError('Notebook has no valid manifest or its metadata is too large.')
+    try:
+        data = json.loads(row[0])
+    except (ValueError, TypeError) as exc:
+        raise ValueError('Notebook metadata is not valid JSON.') from exc
+    if not isinstance(data, dict):
+        raise ValueError('Notebook metadata must be an object.')
+    return data
 
 # These names are reserved by Windows, even with a file extension.
 # We reject them on every OS so notebooks stay portable.
@@ -110,7 +161,7 @@ def default_backup_folder():
 # settings are deliberately NOT overwritten by cross-tab Undo/Redo.
 _TRANSFER_FIELDS = (
     'pages', 'page_groups', 'read_page_ids', 'annotations',
-    'reading_view', 'selected_page',
+    'reading_view', 'selected_page', 'research',
 )
 
 
@@ -205,6 +256,12 @@ class Notebook:
         self._saved_manifest = None
         self.backup_dirty = False
         self._closed = False
+        self._origin_path = None  # set only for explicit-publish local sessions
+        self._origin_lease = None
+        self._session_dir = None
+        self._session_backed_up = False
+        self._session_status = None  # active / closed; no cloud writes on close
+        self._unpublished = False
         # Acquire before the workspace is used and before any SQLite write.
         # Keep the OS handle alive for the whole editable session.
         self._lease = NotebookLease(self.path).acquire()
@@ -219,6 +276,30 @@ class Notebook:
         except BaseException:
             temporary.cleanup()
             raise
+
+    @classmethod
+    def open_session(cls, path: Path, working_base: Path | None = None):
+        """GUI entry point: isolate all autosaves from the published original."""
+        source = Path(path).expanduser().resolve()
+        if source.is_dir():
+            # Migrating a v2-v4 folder produces a NEW v7 notebook alongside
+            # the old folder, then stages that notebook locally as usual.
+            migrated = cls.load(source)
+            migrated_path = migrated.path
+            migrated.close()
+            source = migrated_path
+        from .safe_session import open_working_copy
+        return open_working_copy(source, working_base)
+
+    @property
+    def display_path(self):
+        """The user-selected external notebook path, never its local cache."""
+        return self._origin_path or self.path
+
+    def publish(self):
+        """Explicit Save only: write the verified local version to its origin."""
+        from .safe_session import publish
+        return publish(self)
 
     @classmethod
     def create(cls, parent: Path, name: str, *, extension='.yomunote'):
@@ -252,18 +333,7 @@ class Notebook:
             raise ValueError('Choose a .pinbunote or legacy .yomunote/.yominote notebook.')
         try:
             with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as conn:
-                # Check the metadata size in SQLite, BEFORE fetching a
-                # potentially enormous string into Python memory.
-                size_row = conn.execute(
-                    'SELECT length(value) FROM meta WHERE key=?', ('manifest',)
-                ).fetchone()
-                if (not size_row or type(size_row[0]) is not int
-                        or not 0 < size_row[0] <= MAX_MANIFEST_BYTES):
-                    raise ValueError('Notebook has no valid manifest or it is too large.')
-                row = conn.execute('SELECT value FROM meta WHERE key=?', ('manifest',)).fetchone()
-                if row is None or not isinstance(row[0], str):
-                    raise ValueError('Notebook has no manifest.')
-                meta = json.loads(row[0])
+                meta = read_bounded_manifest(conn)
                 cls._check_manifest(meta)
                 nb = cls._new_workspace(path, meta['name'], meta['tabs'],
                                         meta['active_id'], meta['id'])
@@ -351,9 +421,25 @@ class Notebook:
             raise ValueError('This file is not a supported Pinbu Note notebook.') from exc
 
     @staticmethod
-    def _check_manifest(meta):
-        if not isinstance(meta, dict) or meta.get('format') != MAGIC_FORMAT or meta.get('version') != NOTEBOOK_VERSION:
+    def _check_manifest(meta, *, allow_newer_app=False):
+        if not isinstance(meta, dict) or meta.get('format') != MAGIC_FORMAT:
             raise ValueError('Unsupported notebook container format.')
+        if meta.get('version') not in READABLE_NOTEBOOK_VERSIONS:
+            raise NotebookNewerVersionError(
+                f"This notebook uses format v{meta.get('version')} but this "
+                f"Pinbu Note supports up to format v{NOTEBOOK_VERSION}. Please update "
+                'the app. Do not overwrite this notebook with an older version.')
+        saved_version = _version_sortkey(meta.get('app_version'))
+        current_version = _version_sortkey(__version__)
+        if (not allow_newer_app and saved_version and current_version
+                and saved_version > current_version):
+            raise NotebookNewerVersionError(
+                f"This notebook was saved by newer Pinbu Note "
+                f"v{meta.get('app_version')} (installed: v{__version__}). "
+                'Some features or annotations may not work correctly in this older '
+                'version. We strongly recommend upgrading Pinbu Note. '
+                'The notebook has been left untouched; do not edit or autosave '
+                'over a newer-version notebook with an older app.')
         tabs = meta.get('tabs')
         if not isinstance(tabs, list) or not 1 <= len(tabs) <= MAX_TABS:
             raise ValueError('Invalid number of notebook tabs.')
@@ -510,6 +596,40 @@ class Notebook:
                         promoted.append(destination)
                         mapping[old_relative] = new_relative
                     item[field] = mapping[old_relative]
+                # Copy the EFFECTIVE citation/tag/locator from the source
+                # navigator, not just direct per-page assignments. The
+                # receiving tab may have no corresponding parent group.
+                research = source.research
+                copied_ref = effective_reference(research, source.page_groups, old_id)
+                if copied_ref:
+                    def ensure_reference(ref_id):
+                        record = copy.deepcopy(research['references'][ref_id])
+                        parent = record.get('parent_id')
+                        if parent:
+                            ensure_reference(parent)
+                        previous = target.research['references'].get(ref_id)
+                        if previous is not None and previous != record:
+                            raise ValueError('Reference ID collision during page transfer.')
+                        target.research['references'][ref_id] = record
+                    ensure_reference(copied_ref)
+                    target.research['reference_assignments']['pages'][item['id']] = copied_ref
+                elif (old_id in research['reference_assignments']['pages']
+                      and research['reference_assignments']['pages'][old_id] is None):
+                    # Preserve an intentional 'no citation', without adding
+                    # redundant nulls for every unreferenced copied page.
+                    target.research['reference_assignments']['pages'][item['id']] = None
+                effective = effective_tags(research, source.page_groups, old_id)
+                for tag_id in effective:
+                    tag = copy.deepcopy(research['tags'][tag_id])
+                    existing = target.research['tags'].get(tag_id)
+                    if existing is not None and existing != tag:
+                        raise ValueError('Tag ID collision during page transfer.')
+                    target.research['tags'][tag_id] = tag
+                if effective:
+                    target.research['tag_assignments']['pages'][item['id']] = sorted(effective)
+                original_label = effective_page_label(research, source.page_groups, original)
+                if original_label != str(original.get('source_page') or 1):
+                    target.research['numbering']['pages'][item['id']] = original_label
                 if old_id in source.annotations:
                     target.annotations[item['id']] = copy.deepcopy(source.annotations[old_id])
                 if move and old_id in source.read_page_ids:
@@ -604,7 +724,7 @@ class Notebook:
         for project, expected_state in zip((source, target), expected):
             if any(getattr(project, field) != expected_state[field]
                    for field in ('pages', 'page_groups',
-                                 'annotations', 'read_page_ids')):
+                                 'annotations', 'read_page_ids', 'research')):
                 raise ValueError(
                     'Pages or annotations changed since this transfer; '
                     'cannot safely undo/redo it.')
@@ -670,12 +790,14 @@ class Notebook:
                 item = base / relative_source
                 # Symlinks at any ancestor are forbidden even when they point
                 # back into the notebook workspace.
-                if (not item.is_file() or any(part.is_symlink()
-                       for part in (item, *list(item.parents)[:len(Path(relative_source).parts)]))):
+                unsafe = any(part.is_symlink()
+                             for part in (item, *list(item.parents)[:len(Path(relative_source).parts)]))
+                if unsafe or not item.is_file():
+                    cause = ('unsafe symbolic link' if unsafe else 'missing file')
                     raise ValueError(
                         f'Cannot save notebook: missing or unsafe page asset '
-                        f'in tab "{project.name}": {relative_source}. '
-                        'Restore the original from a backup or reimport it.')
+                        f'in tab "{project.name}": {relative_source} '
+                        f'({cause}). Restore the original from a backup or reimport it.')
                 rel = item.relative_to(self.workspace).as_posix()
                 _safe_relative(rel, ids)
                 yield rel, item
@@ -767,6 +889,10 @@ class Notebook:
             self._saved_manifest = result.manifest
             if result.changed:
                 self.backup_dirty = True
+                if self._origin_path is not None:
+                    self._unpublished = True
+                    from .safe_session import _write_descriptor
+                    _write_descriptor(self)
             return True
 
     def save(self):
@@ -776,6 +902,10 @@ class Notebook:
                 raise RuntimeError('Notebook has been closed.')
             changed = self._save_synchronous()
             self._save_guard.generation += 1
+            if changed and self._origin_path is not None:
+                self._unpublished = True
+                from .safe_session import _write_descriptor
+                _write_descriptor(self)
             return changed
 
     def _save_synchronous(self):
@@ -869,6 +999,22 @@ class Notebook:
             self.backup_dirty = True
         return changed
 
+    def safesave_backup(self, directory: Path | None = None, *, limit: int = 100,
+                        force: bool = False, reason: str = 'automatic'):
+        """Deduplicated per-project snapshots; separate assets and state folders."""
+        from .safe_backup import create_snapshot, prune_snapshots
+        from .safe_session import _write_descriptor
+        self.save()  # atomic local commit before any snapshot is considered valid
+        snapshot, project_dir = create_snapshot(
+            self.path, Path(directory or default_backup_folder()),
+            force=force, reason=reason, logical_source=self.display_path)
+        if snapshot is not None:
+            prune_snapshots(project_dir, max_snapshots=limit)
+            self._session_backed_up = True
+            self.backup_dirty = False
+            _write_descriptor(self)
+        return snapshot
+
     def backup(self, directory: Path | None = None, limit: int = 30):
         """Create a consistent snapshot, retaining at most limit per notebook."""
         directory = Path(directory or default_backup_folder()).expanduser()
@@ -912,10 +1058,7 @@ class Notebook:
         if destination.exists():
             raise FileExistsError('Choose a NEW file name to restore a backup safely.')
         with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as conn:
-            row = conn.execute('SELECT value FROM meta WHERE key=?', ('manifest',)).fetchone()
-            if not row:
-                raise ValueError('Not a supported notebook backup.')
-            Notebook._check_manifest(json.loads(row[0]))
+            Notebook._check_manifest(read_bounded_manifest(conn))
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             with source.open('rb') as input_file, destination.open('xb') as output_file:
@@ -924,8 +1067,7 @@ class Notebook:
             # including its rotating backup history and displayed name.
             with closing(sqlite3.connect(destination)) as conn:
                 with conn:
-                    row = conn.execute('SELECT value FROM meta WHERE key=?', ('manifest',)).fetchone()
-                    meta = json.loads(row[0])
+                    meta = read_bounded_manifest(conn)
                     meta['id'] = uuid.uuid4().hex
                     meta['name'] = safe_name(destination.stem)
                     conn.execute('UPDATE meta SET value=? WHERE key=?',
@@ -962,17 +1104,16 @@ class Notebook:
             # the user can continue working in the original notebook.
             with closing(sqlite3.connect(
                     source.as_uri() + '?mode=ro', uri=True)) as conn:
+                # Validate the *source* before VACUUM creates an entire copy.
+                # Without this preflight, a huge hostile notebook might consume
+                # disk space even though its manifest would fail validation
+                # when we inspect the destination a few lines below.
+                Notebook._check_manifest(read_bounded_manifest(conn))
                 conn.execute('VACUUM INTO ?', (str(destination),))
             # The copy gets its own identity for independent backups.
             with closing(sqlite3.connect(destination)) as conn:
                 with conn:
-                    row = conn.execute(
-                        'SELECT value FROM meta WHERE key=?',
-                        ('manifest',),
-                    ).fetchone()
-                    if not row:
-                        raise ValueError('Cleaned notebook has no manifest.')
-                    meta = json.loads(row[0])
+                    meta = read_bounded_manifest(conn)
                     Notebook._check_manifest(meta)
                     meta['id'] = uuid.uuid4().hex
                     meta['name'] = safe_name(destination.stem)
@@ -1027,10 +1168,22 @@ class Notebook:
         # Closing must not delete source assets while a worker is reading.
         with self._save_guard.lock:
             if not self._closed:
+                if self._session_dir is not None:
+                    from .safe_session import mark_normal_close
+                    mark_normal_close(self)
                 self._save_guard.closed = True
                 self._save_guard.generation += 1
                 try:
                     self._temporary.cleanup()
                 finally:
                     self._lease.release()
+                    if self._origin_lease is not None:
+                        self._origin_lease.release()
+                        self._origin_lease = None
+                    # A staged copy is only disposable after a verified local
+                    # history snapshot AND after explicit publishing. Otherwise
+                    # it is retained for recovery after an unclean exit.
+                    if (self._session_dir is not None and self._session_backed_up
+                            and not self._unpublished):
+                        shutil.rmtree(self._session_dir, ignore_errors=True)
                     self._closed = True

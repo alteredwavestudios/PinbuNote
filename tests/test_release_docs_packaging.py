@@ -22,9 +22,9 @@ def test_release_process_is_draft_only():
     assert '--draft --prerelease' in workflow
     assert 'needs: [windows, macos]' in workflow
     assert 'actions/upload-artifact@v4' in workflow
-    assert 'PinbuNote_Setup_v0.8.7c.exe' in workflow
-    assert 'PinbuNote-0.8.7c-macOS-arm64-unsigned.dmg' in workflow
-    assert 'PinbuNote-0.8.7c-macOS-x86_64-unsigned.dmg' in workflow
+    assert 'PinbuNote_Setup_v${version}.exe' in workflow
+    assert 'PinbuNote-${version}-macOS-arm64-unsigned.dmg' in workflow
+    assert 'PinbuNote-${version}-macOS-x86_64-unsigned.dmg' in workflow
     assert '\n  linux:\n' not in workflow
     # Linux remains source-only, with its regression suite in CI.
     ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')

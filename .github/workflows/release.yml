@@ -8,14 +8,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing pushed tag to rebuild (e.g. v0.8.7c)'
+        description: 'Existing pushed tag to rebuild (e.g. v1.0)'
         required: true
-        default: 'v0.8.7c'
+        default: 'v1.0'
 permissions:
   contents: read
 # Ensure Windows Python reads source as UTF-8, not cp1252.
 env:
   PYTHONUTF8: '1'
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -53,7 +54,9 @@ jobs:
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-windows.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build-installer-windows.ps1
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          Copy-Item installer\PinbuNote_Setup_v0.8.7c.exe release-assets\
+          $version = & .venv\Scripts\python.exe -c 'from yomunote import __version__; print(__version__)'
+          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag and app version disagree" }
+          Copy-Item "installer\PinbuNote_Setup_v$version.exe" release-assets\
       - uses: actions/upload-artifact@v4
         with:
           name: PinbuNote-Windows-Setup
@@ -96,6 +99,8 @@ jobs:
         env:
           CI: 'true'
         run: |
+          version="$(.venv/bin/python -c 'from yomunote import __version__; print(__version__)')"
+          test "$RELEASE_TAG" = "v$version" || { echo 'Tag and app version disagree' >&2; exit 1; }
           zsh build-mac.command
           bash scripts/package-macos-dmg.sh "${{ matrix.architecture }}"
       - uses: actions/upload-artifact@v4
@@ -123,19 +128,23 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh release-assets
-          test -s release-assets/PinbuNote_Setup_v0.8.7c.exe
-          test -s release-assets/PinbuNote-0.8.7c-macOS-arm64-unsigned.dmg
-          test -s release-assets/PinbuNote-0.8.7c-macOS-x86_64-unsigned.dmg
+          version="$(python -c 'from yomunote import __version__; print(__version__)')"
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo 'Release tag does not match app source version' >&2
+            exit 1
+          fi
+          test -s "release-assets/PinbuNote_Setup_v${version}.exe"
+          test -s "release-assets/PinbuNote-${version}-macOS-arm64-unsigned.dmg"
+          test -s "release-assets/PinbuNote-${version}-macOS-x86_64-unsigned.dmg"
           ( cd release-assets && sha256sum * > SHA256SUMS.txt )
       - name: Create unpublished draft with installers
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           gh release create "$RELEASE_TAG" release-assets/* \
             --verify-tag --draft --prerelease \
             --title "Pinbu Note $RELEASE_TAG (pre-release)" \
-            --notes-file RELEASE_NOTES_v0.8.7c.md
+            --notes-file RELEASE_NOTES_v1.0.md
           echo 'Open the draft release, verify each download, then publish manually.' >> "$GITHUB_STEP_SUMMARY"

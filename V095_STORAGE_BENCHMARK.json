@@ -1,0 +1,61 @@
+{
+  "environment": {
+    "python": "3.13.5",
+    "platform": "linux",
+    "rss_base_max_mib": 97.375,
+    "rss_max_mib": 112.0
+  },
+  "notebooks": [
+    {
+      "page_count": 100,
+      "create_s": 0.0066,
+      "project_save_s": 0.0007,
+      "first_save_s": 0.0081,
+      "noop_save_s": 0.0056,
+      "noop_changed": false,
+      "load_s": 0.0129,
+      "db_bytes": 53248,
+      "asset_rows": 2,
+      "peak_process_rss_mib_so_far": 99.2
+    },
+    {
+      "page_count": 1000,
+      "create_s": 0.005,
+      "project_save_s": 0.0032,
+      "first_save_s": 0.0555,
+      "noop_save_s": 0.0521,
+      "noop_changed": false,
+      "load_s": 0.1625,
+      "db_bytes": 299008,
+      "asset_rows": 2,
+      "peak_process_rss_mib_so_far": 100.9
+    },
+    {
+      "page_count": 5000,
+      "create_s": 0.0059,
+      "project_save_s": 0.0213,
+      "first_save_s": 0.2689,
+      "noop_save_s": 0.2874,
+      "noop_changed": false,
+      "load_s": 0.7037,
+      "db_bytes": 1384448,
+      "asset_rows": 2,
+      "peak_process_rss_mib_so_far": 112.0
+    }
+  ],
+  "pdf_import": {
+    "page_count": 400,
+    "index_and_copy_s": 0.0102,
+    "source_bytes": 179791,
+    "cached_previews": 0
+  },
+  "lookup_500_calls_5000page_group_s": {
+    "trials": [
+      0.0545,
+      0.0513,
+      0.0546
+    ],
+    "median": 0.0545
+  },
+  "lock_second_open_rejected": true
+}
