@@ -27,9 +27,9 @@ def test_release_asset_names_agree_with_builders():
     for name in (
         'PinbuNote_Setup_v${version}.exe',
         'PinbuNote-${version}-macOS-arm64-unsigned.dmg',
-        'PinbuNote-${version}-macOS-x86_64-unsigned.dmg',
     ):
         assert name in workflow
+    assert 'macOS-x86_64-unsigned.dmg' not in workflow
     assert '--draft --prerelease' in workflow
     assert '--notes-file RELEASE_NOTES_v1.0.md' in workflow
     assert 'needs: [windows, macos]' in workflow

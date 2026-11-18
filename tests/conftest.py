@@ -65,18 +65,38 @@ def close_test_window():
     from PySide6.QtWidgets import QApplication, QMessageBox
 
     def close(window):
+        # macOS may show the modal dialog after a zero-delay single-shot has
+        # already fired. Retry until Qt actually exposes its real button.
+        # This preserves the application's save/close safety path.
+        timer = QTimer()
+        timer.setInterval(25)
+        attempts = 0
+
         def choose_close_without_saving():
-            for widget in QApplication.topLevelWidgets():
-                if not isinstance(widget, QMessageBox) or not widget.isVisible():
+            nonlocal attempts
+            attempts += 1
+            candidates = list(QApplication.topLevelWidgets())
+            candidates += list(window.findChildren(QMessageBox))
+            for widget in candidates:
+                if not isinstance(widget, QMessageBox):
                     continue
                 if widget.windowTitle() != 'Unsaved changes':
                     continue
                 for button in widget.buttons():
-                    if button.text().replace('&', '') == 'Close Without Saving':
+                    if button.text().replace('&', '').strip() == 'Close Without Saving':
+                        timer.stop()
                         button.click()
                         return
-        QTimer.singleShot(0, choose_close_without_saving)
-        window.close()
+            if attempts >= 200:
+                timer.stop()
+                print('No Unsaved changes dialog appeared within five seconds.', flush=True)
+
+        timer.timeout.connect(choose_close_without_saving)
+        timer.start()
+        try:
+            window.close()
+        finally:
+            timer.stop()
         app = QApplication.instance()
         if app is not None:
             app.processEvents()

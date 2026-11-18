@@ -28,9 +28,9 @@ def test_windows_sqlite_fix_ocr_and_upgrader_identity():
 def test_release_workflow_is_draft_and_asset_consistent():
     w=read('.github/workflows/release.yml')
     for asset in ('PinbuNote_Setup_v${version}.exe',
-                  'PinbuNote-${version}-macOS-arm64-unsigned.dmg',
-                  'PinbuNote-${version}-macOS-x86_64-unsigned.dmg'):
+                  'PinbuNote-${version}-macOS-arm64-unsigned.dmg'):
         assert asset in w
+    assert 'macOS-x86_64-unsigned.dmg' not in w
     assert 'RELEASE_NOTES_v1.0.md' in w
     assert '--verify-tag --draft --prerelease' in w
     assert 'needs: [windows, macos]' in w
