@@ -89,10 +89,10 @@ def close_test_window():
                     self.setOption(QMessageBox.Option.DontUseNativeDialog, True)
 
                 def exec(self):
-                    if self.windowTitle() != 'Unsaved changes':
+                    if 'You have some changes' not in self.text():
                         raise AssertionError(
                             f'Unexpected modal dialog during Mac CI shutdown: '
-                            f'{self.windowTitle()!r}: {self.text()!r}')
+                            f'{self.text()!r}')
                     buttons = [button for button in self.buttons()
                                if button.text().replace('&', '').strip()
                                == 'Close Without Saving']
