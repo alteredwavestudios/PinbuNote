@@ -1,19 +1,19 @@
-; Pinbu Note v0.8.7c Windows installer (Inno Setup 6 or 7)
+; Pinbu Note v1.0 Windows installer (Inno Setup 6 or 7)
 ; Place this file next to main.py and build-windows.ps1 in the extracted
-; Pinbu Note v0.8.7c source folder. First build the app with build-windows.ps1.
+; Pinbu Note v1.0 source folder. First build the app with build-windows.ps1.
 ;
 ; IMPORTANT: Keep AppId unchanged for future Pinbu Note updates, so Windows
 ; recognises subsequent installers as upgrades to the same application.
 
 #define MyAppName "Pinbu Note"
-#define MyAppVersion "0.8.7c"
+#define MyAppVersion "1.0"
 #define MyAppExeName "Pinbu Note.exe"
 
 [Setup]
 AppId={{974AD665-3F47-4CC5-9AAE-0A5F43565469}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-VersionInfoVersion=0.8.7.3
+VersionInfoVersion=1.0.0.0
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher=Pinbu Note
 DefaultDirName={autopf}\{#MyAppName}
@@ -21,7 +21,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 OutputDir=installer
-OutputBaseFilename=PinbuNote_Setup_v0.8.7c
+OutputBaseFilename=PinbuNote_Setup_v{#MyAppVersion}
 SetupIconFile=assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 WizardStyle=modern

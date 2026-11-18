@@ -114,7 +114,7 @@ class FakeNotebook:
 
 
 def fake_window():
-    obj=SimpleNamespace(notebook=FakeNotebook())
+    obj=SimpleNamespace(notebook=FakeNotebook(), _set_autosave_footer=lambda **kwargs: None)
     obj._save_panes_in_one_commit=isolated_method(MAIN,'_save_panes_in_one_commit').__get__(obj)
     return obj
 

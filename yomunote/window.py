@@ -19,6 +19,8 @@ import threading
 import shutil
 from pathlib import Path
 import time
+import hashlib
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import (Qt, QSize, QTimer, QSettings, QUrl, Signal, QPoint, QPointF, QRectF, QEvent, QSignalBlocker,
@@ -34,6 +36,7 @@ from PySide6.QtWidgets import (
     QFontComboBox, QSpinBox, QDoubleSpinBox, QSlider, QWidgetAction, QCheckBox, QColorDialog, QMenu, QSizePolicy, QFrame, QGridLayout, QStyledItemDelegate, QStyleOptionViewItem, QStackedLayout, QLineEdit, QStyle, QProgressBar, QProgressDialog, QPlainTextEdit,
 )
 from .editor import NotesEditor
+from .voice_storage import default_recordings_folder
 from .notes_layout import NotesPageSetup
 from .notes_layout_dialog import NotesPageSetupDialog
 from .platform_shortcuts import IS_MAC, PRIMARY, ALT, SHIFT, docs_shortcut
@@ -42,6 +45,12 @@ from .importers import (ALL_EXTS, blank_page, import_document, image_for_page,
                         clear_obsolete_preview_tiers, trim_disposable_caches,
                         LARGE_THUMB_MAX_WIDTH)
 from .project import Project, PANEL_KEYS, valid_panel_order, short_id, validated_note_pages
+from .navigator_research_display import (build_display_rows, next_mode,
+    DEFAULT_MODES, SECONDARY_MODES, HOVER_MODES)
+from .research import (validate_research, new_reference, set_assignment,
+    effective_reference, effective_tags, effective_page_label,
+    preserve_on_tree_change, make_tag, set_tag, render_reference,
+    render_in_text, to_plain, to_html, missing_required, page_source)
 from .reading_view import (extra_vertical_scene_padding, empty_view, effective_zoom, remember_zoom,
                            normalise_zoom, fit_zoom, root_for_page,
                            root_for_group, pages_in_group,
@@ -67,7 +76,7 @@ from .page_groups import (
     group_extra_vertical_scroll, page_extra_vertical_scroll,
     set_group_extra_vertical_scroll,
 )
-from .notebook import Notebook, MAX_TABS, default_backup_folder
+from .notebook import Notebook, MAX_TABS, default_backup_folder, NotebookNewerVersionError
 from .notebook_lock import NotebookInUseError, NotebookExternallyModifiedError
 from .sticky_note_dialog import StickyNoteDialog
 from .bookmark_badge import paint_bookmark_ribbon
@@ -79,6 +88,7 @@ from .lifecycle import RetiredNotebookQueue
 from .diagnostics import logger, log_folder
 from .resampling import bicubic_rgb_crop, MAX_UPSCALE_SOURCE_PIXELS, MAX_UPSCALE_OUTPUT_PIXELS
 from .preview_clarity import sharpen_cached_preview, MODES as CLARITY_MODES
+from .preview_night import reading_mode, recolour_image
 from .history import UnifiedHistory, CallbackAction, external_undo_action, rename_action, reorder_pages_action
 from .vector_marks import (make_stroke, make_shape, make_highlight, make_highlight_line, make_photo, make_sticky, MAX_PHOTO_JPEG_BYTES, translated_vector,
                            resized_vector, MAX_STROKE_POINTS,
@@ -88,6 +98,10 @@ from .tab_strip import inline_add_position
 from .ocr_engine import (MAX_REGIONS, OCR_DPI, find_tesseract, installed_languages,
                          recognise_regions, OCRCancelled)
 from .pdf_text_engine import inspect_page
+
+class CurrentNotebookSaveError(RuntimeError):
+    """Existing active notebook blocked a switch; target did not need recovery."""
+
 
 # Clipboard JPEGs are source material (not disposable preview caches).
 # Keep a single image page <= 5 MiB and one inline photo <= 320 KiB.
@@ -378,6 +392,23 @@ THEMES.update({
         'preview': '#253a3f'},
 })
 
+# Two deliberately neutral study themes. They use exactly the same colour
+# roles as every original palette; no new theme engine or repaints are needed.
+THEMES.update({
+    'minimal-light': {'name': 'Minimal Light', 'window': '#f4f4f4',
+        'panel': '#fafafa', 'paper': '#ffffff', 'shelf': '#efefef',
+        'canvas': '#f2f2f2', 'ink': '#202020', 'muted': '#575757',
+        'accent': '#444444', 'accent2': '#555555', 'border': '#c7c7c7',
+        'highlight': '#dedede', 'btn': '#ffffff', 'btn2': '#e8e8e8',
+        'preview': '#e9e9e9'},
+    'minimal-dark': {'name': 'Minimal Dark', 'window': '#171717',
+        'panel': '#222222', 'paper': '#292929', 'shelf': '#1c1c1c',
+        'canvas': '#191919', 'ink': '#f2f2f2', 'muted': '#bcbcbc',
+        'accent': '#e2e2e2', 'accent2': '#bbbbbb', 'border': '#5e5e5e',
+        'highlight': '#494949', 'btn': '#313131', 'btn2': '#444444',
+        'preview': '#121212'},
+})
+
 # Stable theme identifiers stay unchanged; only their presentation is grouped.
 THEME_PACKS = {
     'Japanese & Kawaii': (
@@ -392,7 +423,7 @@ THEME_PACKS = {
     'French Art Nouveau': (
         'nouveau-iris', 'nouveau-ginkgo', 'nouveau-peacock',
         'nouveau-velvet'),
-    'Modern & System': ('modern-light', 'modern-dark', 'system'),
+    'Modern & System': ('minimal-light', 'minimal-dark', 'modern-light', 'modern-dark', 'system'),
 }
 
 THEME_NAMES = {key: c['name'] for key, c in THEMES.items()}
@@ -409,7 +440,12 @@ def blend_colour(first: str, second: str, amount: float) -> str:
 
 
 def background_gradient(c):
-    """Create a richer pastel panel with a second complementary colour."""
+    """Create a backdrop without animations or extra graphics items."""
+    if c['name'] in ('Minimal Light', 'Minimal Dark'):
+        # Minimal mode intentionally has a flat surface, not a simulated
+        # fabric/paper gradient. Returning a solid QSS colour also avoids
+        # extra paint work on repeated resizes.
+        return c['panel']
     left = blend_colour(c['panel'], c['accent'], 0.035)
     right = blend_colour(c['panel'], c['accent2'], 0.05)
     return (f"qlineargradient(x1:0,y1:0,x2:1,y2:1,"
@@ -817,10 +853,15 @@ class PageTitleEditor(QWidget):
         self._escape = shortcut
         self._cancelled = False
         self._has_page = False
+        self._stored_title = 'PAGE PREVIEW'
         self.stack.addWidget(self.label)
         self.stack.addWidget(self.edit)
 
-    def setText(self, text):
+    def setText(self, text, *, original=None):
+        # The visible heading may be a citation generated by Preferences.
+        # Renaming must always begin with the real stored page title, not
+        # with that temporary text, or a simple edit could destroy it.
+        self._stored_title = str(text if original is None else original)
         self.label.setText(text)
         if self.stack.currentWidget() is not self.label:
             self.stack.setCurrentWidget(self.label)
@@ -829,7 +870,7 @@ class PageTitleEditor(QWidget):
         if not self._has_page:
             return
         self._cancelled = False
-        self.edit.setText(self.label.text())
+        self.edit.setText(self._stored_title)
         self.stack.setCurrentWidget(self.edit)
         self.edit.setFocus()
         self.edit.selectAll()
@@ -844,7 +885,8 @@ class PageTitleEditor(QWidget):
             return
         title = self.edit.text().strip()
         self.stack.setCurrentWidget(self.label)
-        if title and title != self.label.text():
+        if title and title != self._stored_title:
+            self._stored_title = title
             self.label.setText(title)
             self.renamed.emit(title)
 
@@ -950,16 +992,46 @@ class AnimatedPageDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         rect = option.rect.adjusted(3, 2, -3, -2)
-        number_rect = QRect(rect.left() + 5, rect.bottom() - 20,
-                            rect.width() - 10, 18)
-        font = painter.font()
-        font.setPointSize(8 if option.rect.width() < 175 else
-                          9 if option.rect.width() < 300 else 10)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(self.ink)
-        painter.drawText(number_rect, Qt.AlignmentFlag.AlignCenter,
-                         str(index.row() + 1))
+        info = getattr(self.view, '_display_rows', {}).get(
+            index.data(Qt.ItemDataRole.UserRole))
+        text = info['number'] if info else str(index.row() + 1)
+        if text:
+            number_rect = self.view.number_rect(option.rect)
+            font = painter.font()
+            font.setPointSize(8 if option.rect.width() < 175 else 9)
+            font.setBold(False)
+            painter.setFont(font)
+            border = QColor(self.accent if info and info.get('direct') else
+                            self.view.palette().color(QPalette.ColorRole.Mid))
+            background = self.view.palette().color(QPalette.ColorRole.Base)
+            background.setAlpha(225)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setBrush(background)
+            painter.setPen(QPen(border, 0.7))
+            painter.drawRoundedRect(number_rect, 5, 5)
+            painter.setPen(self.view.palette().color(QPalette.ColorRole.Text))
+            symbol = '◆ ' if info and info.get('direct') else (
+                '◇ ' if info and info.get('reference_id') else '')
+            paint_text = painter.fontMetrics().elidedText(
+                symbol + text, Qt.TextElideMode.ElideRight, number_rect.width() - 6)
+            painter.drawText(number_rect.adjusted(3, 0, -3, 0),
+                             Qt.AlignmentFlag.AlignCenter, paint_text)
+        # Optional secondary research info, only where there's enough room.
+        # This stays separate from the image: no thumbnail re-render or cache.
+        secondary = info.get('secondary', '') if info else ''
+        available = option.rect.width() - 105
+        if secondary and available >= 70:
+            painter.setFont(QFont('Montserrat', 8))
+            # 'Mid' is the colour Qt uses for subtle borders/shadows; it is
+            # deliberately low-contrast in dark themes. Small bibliography
+            # text needs real foreground ink, independent of selection.
+            painter.setPen(self.view.palette().color(QPalette.ColorRole.Text))
+            extra = painter.fontMetrics().elidedText(
+                secondary, Qt.TextElideMode.ElideRight, available)
+            painter.drawText(QRect(rect.left() + 9, rect.bottom() - 20,
+                                   available, 18),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             extra)
         # Draw over the existing thumbnail; never alter/copy its raster data.
         if index.data(Qt.ItemDataRole.UserRole + 1):
             paint_bookmark_ribbon(painter, row.right()-23, row.top()+8,
@@ -982,6 +1054,7 @@ class DropPageList(QListWidget):
     blankAt = Signal(int)
     orderChanged = Signal()
     visibleAreaChanged = Signal()
+    numberClicked = Signal(str)
     pagesPasted = Signal(str, str, list, bool)
     PAGE_MIME = 'application/x-yomu-notebook-pages'
 
@@ -1007,6 +1080,9 @@ class DropPageList(QListWidget):
         self.viewport().setMouseTracking(True)
         self._hover_delegate = AnimatedPageDelegate(self)
         self.setItemDelegate(self._hover_delegate)
+        self._display_rows = {}
+        # A badge click must not change the selected/active page on mouse-down.
+        self._number_press_id = None
         self.verticalScrollBar().valueChanged.connect(lambda _: self.visibleAreaChanged.emit())
         # Mouse-wheel clicks ease gently. Native trackpad pixel scrolling must
         # remain untouched because macOS already supplies precise momentum.
@@ -1036,6 +1112,69 @@ class DropPageList(QListWidget):
         self.fade.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self.plus.hide()
 
+    @staticmethod
+    def number_rect(row):
+        return QRect(row.right() - 60, row.bottom() - 23, 55, 19)
+
+    def set_research_display(self, rows):
+        self._display_rows = rows
+        for index in range(self.count()):
+            item = self.item(index)
+            info = rows.get(item.data(Qt.ItemDataRole.UserRole))
+            if info:
+                item.setText(info.get('display_title', info['title']))
+                item.setToolTip(info['tooltip'])
+                item.setData(Qt.ItemDataRole.AccessibleDescriptionRole,
+                             info['number_tooltip'] + '. ' + info['reference_summary'])
+        self.viewport().update()
+
+    def _number_hit(self, point):
+        item = self.itemAt(point)
+        if item is None:
+            return None
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        info = self._display_rows.get(pid)
+        return pid if info and info['number'] and self.number_rect(
+            self.visualItemRect(item)).contains(point) else None
+
+    def mousePressEvent(self, event):
+        # Qt selects a list item on mouse-down. Consume a badge press before
+        # that happens; changing a displayed number is not page navigation.
+        self._number_press_id = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._number_press_id = self._number_hit(event.position().toPoint())
+            if self._number_press_id is not None:
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        pending = self._number_press_id
+        self._number_press_id = None
+        if event.button() == Qt.MouseButton.LeftButton and pending is not None:
+            if pending == self._number_hit(event.position().toPoint()):
+                self.numberClicked.emit(pending)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        # Double-clicking a number must not activate or edit its page.
+        if self._number_hit(event.position().toPoint()) is not None:
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Type.ToolTip:
+            pid = self._number_hit(event.pos())
+            if pid is not None:
+                from PySide6.QtWidgets import QToolTip
+                QToolTip.showText(event.globalPos(), self._display_rows[pid]['number_tooltip'],
+                                  self.viewport())
+                return True
+        return super().viewportEvent(event)
+
     def _freeze_insert_gap(self):
         self._menu_insert_index = max(0, min(self._insert_index, self.count()))
 
@@ -1060,6 +1199,13 @@ class DropPageList(QListWidget):
                   Qt.DropAction.MoveAction)
 
     def keyPressEvent(self, event):
+        if (event.key() == Qt.Key.Key_N and
+                event.modifiers() == Qt.KeyboardModifier.AltModifier):
+            item = self.currentItem()
+            if item is not None:
+                self.numberClicked.emit(item.data(Qt.ItemDataRole.UserRole))
+                event.accept()
+                return
         if event.matches(QKeySequence.StandardKey.Copy):
             payload = self._page_transfer_mime()
             if payload:
@@ -1164,7 +1310,10 @@ class DropPageList(QListWidget):
         super().mouseMoveEvent(event)
         hit = self.itemAt(event.position().toPoint())
         self._hover_delegate.set_hover_row(self.row(hit) if hit else -1)
-        boundary = self._boundary(event.position().toPoint())
+        # The insert-page '+' button shares the bottom-right corner of
+        # a row. Never animate it over the new number badge's hit target.
+        boundary = (None if self._number_hit(event.position().toPoint()) is not None
+                    else self._boundary(event.position().toPoint()))
         if boundary:
             self._insert_index, y = boundary
             self.plus.move(max(5, self.viewport().width() - 40),
@@ -1208,27 +1357,37 @@ class DropPageList(QListWidget):
 
 
 class MultiplyHighlightItem(QGraphicsRectItem):
-    """Tint the underlying document instead of washing it out with source-over.
+    """Highlight the page using a blend suitable for its reading appearance.
 
-    Multiply preserves dark writing beneath a translucent highlighter.  The
-    item is still vector scene geometry and works at every document zoom.
+    Ordinary white-paper reading uses Multiply, preserving the printed ink.
+    On dark paper, Multiply would make yellow ink almost invisible. Screen
+    instead lifts the highlight colour without painting a solid rectangle.
+    This changes the visible graphics blend ONLY; saved marks stay untouched.
     """
+    reading_dark = False
+
     def paint(self, painter, option, widget=None):
         painter.save()
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Multiply)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Screen if self.reading_dark
+            else QPainter.CompositionMode.CompositionMode_Multiply)
         painter.fillRect(self.rect(), self.brush())
         painter.restore()
 
 
 class MultiplyStrokeItem(QGraphicsPathItem):
-    """Multiply translucent marker ink against the *underlying* PDF pixels.
+    """Multiply on light paper, Screen on preview-only dark paper.
 
-    The painter's blend mode is scoped to this item; opaque historical pen
-    strokes continue to render with their original appearance.
+    The painter's blend is scoped to this vector mark; its saved colour,
+    geometry, and opacity do not change when the user switches reading mode.
     """
+    reading_dark = False
+
     def paint(self, painter, option, widget=None):
         painter.save()
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Multiply)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Screen if self.reading_dark
+            else QPainter.CompositionMode.CompositionMode_Multiply)
         super().paint(painter, option, widget)
         painter.restore()
 
@@ -1567,6 +1726,7 @@ class ImageCanvas(QGraphicsView):
         self._stroke_drag_origin = None
         self._stroke_drag_start = None
         self._stroke_items = {}
+        self._reading_mode = 'original'  # solely a visual setting, never saved into PDFs
         self._highlight_origin = None
         self._live_highlight = None
         self._marks = []
@@ -2026,6 +2186,8 @@ class ImageCanvas(QGraphicsView):
     def _draw_stroke(self, mark, index):
         item_type = MultiplyStrokeItem if mark.get('blend') == 'multiply' else QGraphicsPathItem
         item = item_type(self._stroke_path(mark['points']))
+        if isinstance(item, MultiplyStrokeItem):
+            item.reading_dark = self._reading_mode != 'original'
         self._apply_item_appearance(item, mark)
         return self._register_vector_item(item, mark, index)
 
@@ -2045,6 +2207,7 @@ class ImageCanvas(QGraphicsView):
     def _draw_highlight(self, mark, index):
         """Both page-highlighter modes multiply against the visible page."""
         item = MultiplyStrokeItem(self._shape_path(mark))
+        item.reading_dark = self._reading_mode != 'original'
         self._apply_item_appearance(item, mark)
         return self._register_vector_item(item, mark, index, z=3)
 
@@ -2192,6 +2355,7 @@ class ImageCanvas(QGraphicsView):
 
     def _mark_rect(self, rect, color, opacity=35):
         item = MultiplyHighlightItem(rect)
+        item.reading_dark = self._reading_mode != 'original'
         shade = QColor(color)
         shade.setAlphaF(float(opacity)/100)
         item.setBrush(QBrush(shade))
@@ -2867,6 +3031,50 @@ class ImageCanvas(QGraphicsView):
         else:
             self.zoomChanged.emit(abs(self.transform().m11()) * 100.0, self._fit)
 
+    def set_reading_mode(self, mode):
+        # A settled bicubic crop may still belong to the previous appearance.
+        # Drop it immediately; the new bitmap can schedule its own crop later.
+        if reading_mode(mode) != self._reading_mode:
+            self.stop_bicubic()
+        self._reading_mode = reading_mode(mode)
+        # Existing vector annotations keep their colours. Only the *blend*
+        # switches for highlighting so yellow remains visible on charcoal.
+        for mark_item in self._marks:
+            if isinstance(mark_item, (MultiplyStrokeItem, MultiplyHighlightItem)):
+                mark_item.reading_dark = self._reading_mode != 'original'
+                mark_item.update()
+
+    def _apply_reading_colours(self, image):
+        """Transform one decoded page QImage; never change cache or OCR.
+
+        This temporary copy replaces the preview bitmap; we do NOT hold both
+        a normal and dark QPixmap in the scene or recolour on every paint.
+        Pillow performs its pixels operations in native code, not a Python
+        pixel-by-pixel loop. All Qt objects stay on the GUI thread.
+        """
+        if image.isNull() or self._reading_mode == 'original':
+            return image
+        try:
+            # Qt's native inversion avoids building several full-page Pillow
+            # buffers for simple Invert, or for exceptionally large scans.
+            if (self._reading_mode == 'inverted' or
+                    image.width() * image.height() > 3_000_000):
+                result = image.copy()
+                result.invertPixels(QImage.InvertMode.InvertRgb)
+                return result
+            rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+            from PIL import Image
+            # RGBA8888 has exactly four bytes per pixel and no row padding.
+            pil = Image.frombytes('RGBA', (rgba.width(), rgba.height()),
+                                  bytes(rgba.constBits()))
+            changed = recolour_image(pil, self._reading_mode)
+            return QImage(changed.tobytes(), changed.width, changed.height,
+                          QImage.Format.Format_RGBA8888).copy()
+        except (ValueError, MemoryError, OSError) as error:
+            # If a strange or very large scanned image fails the transform,
+            # the source page remains readable instead of disappearing.
+            return image
+
     def replace_quality_image(self, path: Path) -> bool:
         """Replace the displayed page from its disposable JPEG cache."""
         if self._reference_size.isEmpty() or not path:
@@ -2876,7 +3084,7 @@ class ImageCanvas(QGraphicsView):
         image = reader.read()
         if image.isNull():
             return False
-        return self._replace_quality_pixmap(QPixmap.fromImage(image))
+        return self._replace_quality_pixmap(QPixmap.fromImage(self._apply_reading_colours(image)))
 
     def replace_quality_rgb(self, width: int, height: int, pixels: bytes) -> bool:
         """Display optional low-zoom clarity pixels; never write new caches.
@@ -2891,7 +3099,7 @@ class ImageCanvas(QGraphicsView):
                        QImage.Format.Format_RGB888).copy()
         if image.isNull():
             return False
-        return self._replace_quality_pixmap(QPixmap.fromImage(image))
+        return self._replace_quality_pixmap(QPixmap.fromImage(self._apply_reading_colours(image)))
 
     def _replace_quality_pixmap(self, pixmap: QPixmap) -> bool:
         """Preserve the scene coordinates, zoom, scroll and vector highlights."""
@@ -2937,7 +3145,7 @@ class ImageCanvas(QGraphicsView):
             reader = QImageReader(str(path))
             reader.setAutoTransform(True)
             decoded = reader.read()
-            pixmap = QPixmap.fromImage(decoded) if not decoded.isNull() else QPixmap()
+            pixmap = QPixmap.fromImage(self._apply_reading_colours(decoded)) if not decoded.isNull() else QPixmap()
         else:
             pixmap = QPixmap()
         self.stop_bicubic()
@@ -3168,6 +3376,9 @@ class ProjectPane(QWidget):
         self._quality_level = 1.0
         self._normal_preview_path = None
         self._displayed_cache_path = None
+        # Per-user preview preference; never part of notebook storage.
+        self._preview_reading_mode = reading_mode(str(
+            self.settings.value('previewReadingMode', 'original')))
         # Display-only sharpening for already Lanczos-downscaled previews.
         # Work occurs in one background job, with no extra cache files.
         self._clarity_token = 0
@@ -3339,6 +3550,7 @@ class ProjectPane(QWidget):
         self.pages_list.visibleAreaChanged.connect(self.schedule_thumbnails)
         self.pages_list.verticalScrollBar().valueChanged.connect(shelf.scroll_pulse)
         self.pages_list.currentItemChanged.connect(self.select_item)
+        self.pages_list.numberClicked.connect(self._cycle_page_number)
         # Yomu v0.3.1 hotfix: Navigate the selected left-shelf page even
         # while writing in the notes column. Qt maps Ctrl to Cmd on macOS.
         # WidgetWithChildrenShortcut prevents shortcuts in an inactive tab
@@ -3386,6 +3598,7 @@ class ProjectPane(QWidget):
             lambda source, target, ids, copying:
             self.pages_list.pagesPasted.emit(source, target, ids, copying))
         self.group_tree.pageActivated.connect(self.select_page_id)
+        self.group_tree.numberClicked.connect(self._cycle_page_number)
         # Defer model changes until Qt has finished its current click.
         # Rebuilding QTreeWidget inside itemChanged/dropEvent can delete
         # the item while Qt still processes the mouse event.
@@ -3486,6 +3699,7 @@ class ProjectPane(QWidget):
         preview_header_row.addWidget(self.navigator_toggle)
         cl.addLayout(preview_header_row)
         self.canvas = ImageCanvas()
+        self.canvas.set_reading_mode(self._preview_reading_mode)
         self._ocr_cancel_event = None
         self._ocr_running = False
         self._ocr_last_text = ''
@@ -3518,6 +3732,21 @@ class ProjectPane(QWidget):
         self.fit_action.setChecked(True)  # new pages open in Fit mode
         self.fit_action.setToolTip('Auto-fit page to preview. Click again to lock the current zoom.')
         self.fit_action.triggered.connect(self.canvas_fit)
+        # These two preview-only modes never alter the app theme, source PDF,
+        # OCR data or cached preview JPEGs. Original remains the safe default.
+        self.preview_dark_action = controls.addAction('☾ Dark')
+        self.preview_dark_action.setCheckable(True)
+        self.preview_dark_action.setChecked(self._preview_reading_mode == 'smart')
+        self.preview_dark_action.setToolTip(
+            'Smart dark paper and light ink (preview only). Click again for original colours.')
+        self.preview_dark_action.triggered.connect(
+            lambda checked: self.set_preview_reading_mode('smart' if checked else 'original'))
+        self.preview_invert_action = controls.addAction('Invert')
+        self.preview_invert_action.setCheckable(True)
+        self.preview_invert_action.setChecked(self._preview_reading_mode == 'inverted')
+        self.preview_invert_action.setToolTip('Invert every colour, including images (preview only)')
+        self.preview_invert_action.triggered.connect(
+            lambda checked: self.set_preview_reading_mode('inverted' if checked else 'original'))
         self.preview_zoom_label = QLabel('Page · —')
         self.preview_zoom_label.setObjectName('hintLabel')
         self.preview_zoom_label.setMinimumWidth(86)
@@ -4616,6 +4845,9 @@ class ProjectPane(QWidget):
         # Update the matching group row in-place: no tree rebuild or PDF work.
         if hasattr(self, 'group_tree'):
             self.group_tree.update_page_bookmark(page_id, label)
+            # Bookmark updates historically replace row tooltips; restore the
+            # richer bibliography hover from the central display resolver.
+            self._refresh_number_labels()
         active = self.current_page()
         if active is not None and active['id'] == page_id:
             self.canvas.set_page_bookmarked(bool(label), label)
@@ -4941,6 +5173,7 @@ class ProjectPane(QWidget):
         self._group_thumb_pending.clear()
         self._wanted_group_thumb_ids = frozenset()
         self.schedule_thumbnails()
+        self._refresh_number_labels()
         self._refresh_reading_summary()
 
     def _refresh_reading_summary(self):
@@ -5030,12 +5263,14 @@ class ProjectPane(QWidget):
             self._refresh_group_tree()
             QMessageBox.warning(self, 'Reading progress', str(exc))
 
-    def _apply_group_snapshot(self, tree, pages, selected):
+    def _apply_group_snapshot(self, tree, pages, selected, research=None):
         """Apply one validated data snapshot for a group Undo/Redo action."""
         order = [page['id'] for page in pages]
         validate_group_tree(tree, order)
         self.project.pages = list(pages)
         self.project.page_groups = copy.deepcopy(tree)
+        if research is not None:
+            self.project.research = copy.deepcopy(research)
         self.project.selected_page = (
             selected if selected in order else (order[0] if order else None))
         self.load_pages(select_id=self.project.selected_page)
@@ -5052,6 +5287,7 @@ class ProjectPane(QWidget):
         tree whose page IDs match the project's flat reading sequence.
         """
         previous_tree = copy.deepcopy(self.project.page_groups)
+        previous_research = copy.deepcopy(self.project.research)
         previous_pages = list(self.project.pages)
         previous_selected = self.project.selected_page
         remove = set(removed_ids)
@@ -5068,12 +5304,17 @@ class ProjectPane(QWidget):
             return
         self._separate_text_commands()
         new_tree = copy.deepcopy(tree)
+        # Group metadata is sparse. Materialise only changed effective
+        # references/tags/printed locators before the old parents disappear.
+        new_research = preserve_on_tree_change(
+            previous_research, previous_tree, new_tree, previous_pages)
         self.history.perform(CallbackAction(
             label,
             lambda: self._apply_group_snapshot(
-                previous_tree, previous_pages, previous_selected),
+                previous_tree, previous_pages, previous_selected,
+                previous_research),
             lambda: self._apply_group_snapshot(
-                new_tree, new_pages, previous_selected),
+                new_tree, new_pages, previous_selected, new_research),
             512 + len(order) * 72,
         ))
 
@@ -5205,6 +5446,384 @@ class ProjectPane(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, 'Cannot move pages', str(exc))
 
+    # v0.9.2b navigator presentation: QSettings, *not* SQLite/project.json.
+    # A sparse per-page override only tracks explicit display-mode clicks.
+    def _number_settings_key(self):
+        notebook = getattr(self.group_tree, 'notebook_id', None) or self.project.identifier
+        return f'navigatorNumberOverrides/{notebook}/{self._tab_id}'
+
+    def _load_number_display_overrides(self):
+        raw = self.settings.value(self._number_settings_key(), '{}')
+        try:
+            value = json.loads(raw) if isinstance(raw, str) else {}
+            if not isinstance(value, dict):
+                value = {}
+            live = {p['id'] for p in self.project.pages}
+            self._number_overrides = {k: v for k, v in value.items()
+                                      if k in live and v in ('printed', 'source', 'tree')}
+        except (ValueError, TypeError):
+            self._number_overrides = {}
+
+    def _refresh_number_labels(self):
+        if not hasattr(self, 'group_tree'):
+            return
+        if not hasattr(self, '_number_overrides'):
+            self._load_number_display_overrides()
+        self._number_display_rows = build_display_rows(
+            self.project.research, self.project.page_groups or [], self.project.pages,
+            default=str(self.settings.value('navigatorNumberDefault', 'smart')),
+            overrides=self._number_overrides,
+            secondary=str(self.settings.value('navigatorSecondary', 'author')),
+            hover=str(self.settings.value('navigatorHover', 'summary')),
+            reference_labels=str(self.settings.value(
+                'navigatorReferenceLabels', 'false')).lower() == 'true')
+        from .navigator_research_display import group_reference_labels
+        group_labels = group_reference_labels(
+            self.project.research, self.project.page_groups or [],
+            enabled=str(self.settings.value(
+                'navigatorReferenceLabels', 'false')).lower() == 'true')
+        self.group_tree.set_research_display(
+            self._number_display_rows, group_labels=group_labels)
+        self.pages_list.set_research_display(self._number_display_rows)
+        # The preview heading is also a label. The inline rename widget
+        # keeps the original title separately so editing remains safe.
+        current = self.current_page()
+        if current is not None and hasattr(self, 'page_title'):
+            info = self._number_display_rows.get(current['id'], {})
+            if self.page_title.stack.currentWidget() is self.page_title.label:
+                self.page_title.setText(info.get('display_title', current['title']),
+                                        original=current['title'])
+
+    def _set_page_number_mode(self, page_id, mode):
+        rows = getattr(self, '_number_display_rows', {})
+        info = rows.get(page_id)
+        if not info:
+            return
+        if mode != 'reset' and mode not in info['available_modes']:
+            return
+        if mode == 'reset':
+            self._number_overrides.pop(page_id, None)
+        else:
+            self._number_overrides[page_id] = mode
+        self.settings.setValue(self._number_settings_key(),
+                               json.dumps(self._number_overrides, separators=(',', ':')))
+        # Display-only: deliberately NO history action and NO schedule_save.
+        self._refresh_number_labels()
+
+    def _cycle_page_number(self, page_id):
+        info = getattr(self, '_number_display_rows', {}).get(page_id)
+        if info:
+            self._set_page_number_mode(page_id,
+                next_mode(info['number_mode'], info['available_modes']))
+
+    def _number_context_menu(self, menu, page_id):
+        info = getattr(self, '_number_display_rows', {}).get(page_id)
+        if not info:
+            return
+        number_menu = menu.addMenu('Page number display')
+        for name, mode in (('Printed / bibliographic', 'printed'),
+                           ('Original PDF / slide / source', 'source'),
+                           ('Order within group', 'tree')):
+            action = number_menu.addAction(name,
+                 lambda _=False, pid=page_id, value=mode:
+                 self._set_page_number_mode(pid, value))
+            action.setCheckable(True)
+            action.setChecked(info['number_mode'] == mode)
+            action.setEnabled(mode in info['available_modes'])
+        number_menu.addSeparator()
+        number_menu.addAction('Reset to Preferences',
+              lambda _=False, pid=page_id: self._set_page_number_mode(pid, 'reset'))
+
+    # RESEARCH v0.9.2a: navigator-first, no additional permanent panel.
+    # Every edit is one per-tab history action and uses existing SafeSave.
+    def _apply_research_snapshot(self, data):
+        self.project.research = copy.deepcopy(data)
+        self._refresh_number_labels()
+        self.schedule_save()
+
+    def _commit_research(self, changed, label):
+        clean = validate_research(changed)
+        before = copy.deepcopy(self.project.research)
+        if before == clean:
+            return
+        self._separate_text_commands()
+        self.history.perform(CallbackAction(
+            label,
+            lambda: self._apply_research_snapshot(before),
+            lambda: self._apply_research_snapshot(clean),
+            min(2000000, 350 + len(str(clean)))))
+
+    def _research_reference_for_target(self, kind, identifier):
+        research = self.project.research
+        if kind == 'pages':
+            return effective_reference(research, self.project.page_groups, identifier)
+        # Groups can directly specify a source; if not, use the first
+        # descendant page's effective source (which can inherit a parent).
+        direct = research['reference_assignments']['groups'].get(identifier)
+        if identifier in research['reference_assignments']['groups']:
+            return direct
+        from .page_groups import get_group, flatten
+        node = get_group(self.project.page_groups, identifier)
+        pages = flatten([node]) if node else []
+        return (effective_reference(research, self.project.page_groups, pages[0])
+                if pages else None)
+
+    def _research_new_reference(self, kind, identifier):
+        from .research_ui import ReferenceEditor
+        dialog = ReferenceEditor(parent=self, existing_references=self.project.research['references'])
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        changed = copy.deepcopy(self.project.research)
+        ref_id = new_reference(changed, dialog.record())
+        set_assignment(changed, kind, identifier, ref_id)
+        self._commit_research(changed, 'Create and Assign Reference')
+        self.statusMessage.emit('Reference saved · Cite Them Right Harvard')
+
+    def _research_choose_reference(self, kind, identifier):
+        refs = self.project.research['references']
+        if not refs:
+            self._research_new_reference(kind, identifier)
+            return
+        choices = [f"{ref.get('authors', [''])[0] if ref.get('authors') else ref['title']} "
+                   f"({ref.get('year','no date')}) — {ref['title']}" for ref in refs.values()]
+        choices.append('➕ Create a new reference…')
+        choice, ok = QInputDialog.getItem(
+            self, 'Assign reference', 'Choose a saved reference:', choices, 0, False)
+        if not ok:
+            return
+        if choice == choices[-1]:
+            self._research_new_reference(kind, identifier)
+            return
+        index = choices.index(choice)
+        reference_id = list(refs)[index]
+        changed = copy.deepcopy(self.project.research)
+        set_assignment(changed, kind, identifier, reference_id)
+        self._commit_research(changed, 'Assign Reference')
+
+    def _research_edit_reference(self, kind, identifier):
+        ref_id = self._research_reference_for_target(kind, identifier)
+        if not ref_id or ref_id not in self.project.research['references']:
+            self._research_choose_reference(kind, identifier)
+            return
+        from .research_ui import ReferenceEditor
+        dialog = ReferenceEditor(self.project.research['references'][ref_id], self,
+                                 existing_references=self.project.research['references'])
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        changed = copy.deepcopy(self.project.research)
+        changed['references'][ref_id] = dialog.record()
+        self._commit_research(changed, 'Edit Bibliographic Reference')
+
+    def _research_clear_reference(self, kind, identifier):
+        # Explicit None blocks inherited parent citations; no invented source.
+        changed = copy.deepcopy(self.project.research)
+        set_assignment(changed, kind, identifier, None)
+        self._commit_research(changed, 'Clear Reference Assignment')
+
+    def _research_copy(self, kind, identifier, style):
+        ref_id = self._research_reference_for_target(kind, identifier)
+        refs = self.project.research['references']
+        if not ref_id or ref_id not in refs:
+            QMessageBox.information(self, 'No reference assigned',
+                                    'Assign a reference to this page or group first.')
+            return
+        record = refs[ref_id]
+        missing = missing_required(record)
+        if missing and style == 'bibliography':
+            answer = QMessageBox.question(
+                self, 'Incomplete reference',
+                'This reference is missing: ' + ', '.join(missing) +
+                '.\n\nCopy the incomplete reference anyway?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if style == 'bibliography':
+            parent = refs.get(record.get('parent_id')) if record.get('parent_id') else None
+            spans = render_reference(record, parent=parent)
+        else:
+            page = self.project.page_by_id(identifier) if kind == 'pages' else None
+            label = effective_page_label(self.project.research,
+                                         self.project.page_groups, page) if page else None
+            spans = render_in_text(record,
+                page=(label if style == 'intext-page' else None),
+                narrative=(style == 'narrative'))
+        # QMimeData retains BOTH rich HTML (italics in Word/Google Docs)
+        # and the plain text fallback, without writing to the notebook.
+        mime = QMimeData()
+        mime.setText(to_plain(spans))
+        mime.setHtml(to_html(spans))
+        QApplication.clipboard().setMimeData(mime)
+        self.statusMessage.emit('Reference copied to clipboard')
+
+    def _research_create_tag(self, kind, identifier):
+        name, ok = QInputDialog.getText(self, 'New research tag', 'Tag name:')
+        if not ok or not name.strip():
+            return
+        changed = copy.deepcopy(self.project.research)
+        existing = next((tid for tid, val in changed['tags'].items()
+                         if val['name'].casefold() == name.strip().casefold()), None)
+        if existing:
+            tag_id = existing
+        else:
+            tag_id = make_tag(changed, name)
+        set_tag(changed, kind, identifier, tag_id, True)
+        self._commit_research(changed, 'Tag Research Item')
+
+    def _research_toggle_tag(self, kind, identifier, tag_id, enabled):
+        changed = copy.deepcopy(self.project.research)
+        set_tag(changed, kind, identifier, tag_id, enabled)
+        self._commit_research(changed, 'Update Research Tags')
+
+    def _research_set_page_number(self, page_id):
+        page = self.project.page_by_id(page_id)
+        if not page:
+            return
+        current = effective_page_label(self.project.research,
+                                       self.project.page_groups, page)
+        value, ok = QInputDialog.getText(
+            self, 'Printed page number',
+            'Printed number (leave blank to restore the inherited/PDF number):',
+            text=current)
+        if not ok:
+            return
+        changed = copy.deepcopy(self.project.research)
+        if value.strip():
+            changed['numbering']['pages'][page_id] = value.strip()
+        else:
+            changed['numbering']['pages'].pop(page_id, None)
+        self._commit_research(changed, 'Set Printed Page Number')
+
+    def _research_set_group_offset(self, group_id):
+        from .page_groups import get_group, flatten
+        node = get_group(self.project.page_groups, group_id)
+        if not node:
+            return
+        children = flatten([node])
+        sources = [self.project.page_by_id(pid) for pid in children]
+        sources = [p for p in sources if p]
+        if not sources:
+            QMessageBox.information(self, 'No pages', 'This group has no pages to number.')
+            return
+        first = sources[0].get('source_page') or 1
+        start_pdf, ok = QInputDialog.getInt(
+            self, 'Bulk printed-page offset',
+            'PDF page number where printed numbering starts:', first, 1, 20000)
+        if not ok:
+            return
+        start_label, ok = QInputDialog.getInt(
+            self, 'Bulk printed-page offset',
+            'Corresponding printed page number:', 1, 1, 1000000)
+        if not ok:
+            return
+        labels = ['Arabic (1, 2, 3)', 'Roman lowercase (i, ii, iii)',
+                  'Roman uppercase (I, II, III)']
+        scheme, ok = QInputDialog.getItem(
+            self, 'Printed-page numbering style', 'Style:', labels, 0, False)
+        if not ok:
+            return
+        changed = copy.deepcopy(self.project.research)
+        changed['numbering']['groups'][group_id] = {
+            'start_pdf':start_pdf, 'start_label':start_label,
+            'scheme':('arabic','roman-lower','roman-upper')[labels.index(scheme)]}
+        self._commit_research(changed, 'Set Group Printed Page Offset')
+
+    def _research_search_tags(self):
+        tags = self.project.research['tags']
+        if not tags:
+            QMessageBox.information(self, 'Research tags',
+                                    'No tags yet. Right-click a group or page to create one.')
+            return
+        names = [f"{tag['name']}  ·  {identifier[:6]}" for identifier, tag in tags.items()]
+        chosen, ok = QInputDialog.getItem(
+            self, 'Search tagged pages', 'Choose a research tag:', names, 0, False)
+        if not ok:
+            return
+        identifier = list(tags)[names.index(chosen)]
+        matches = [page for page in self.project.pages
+                   if identifier in effective_tags(self.project.research,
+                                                    self.project.page_groups, page['id'])]
+        if not matches:
+            QMessageBox.information(self, 'Research tags',
+                                    'No current pages have this tag.')
+            return
+        labels = [f"{i+1}. {page['title']}  ·  PDF p. {page.get('source_page') or 1}"
+                  for i, page in enumerate(matches)]
+        pick, ok = QInputDialog.getItem(
+            self, 'Tagged pages', f'{len(matches)} matching page(s):', labels, 0, False)
+        if ok:
+            self.select_page_id(matches[labels.index(pick)]['id'])
+
+    def _research_search_references(self):
+        refs=self.project.research['references']
+        if not refs:
+            QMessageBox.information(self, 'References',
+                                    'No bibliographic references yet.')
+            return
+        options=[f"{ref['title']} ({ref.get('year', 'no date')}) · {rid[:6]}"
+                 for rid,ref in refs.items()]
+        chosen, ok = QInputDialog.getItem(
+            self, 'Find reference', 'Choose a reference:', options, 0, False)
+        if not ok:
+            return
+        ref_id=list(refs)[options.index(chosen)]
+        pages=[page for page in self.project.pages
+               if effective_reference(self.project.research,
+                   self.project.page_groups,page['id'])==ref_id]
+        if not pages:
+            QMessageBox.information(self,'Find reference',
+                                    'This reference has no pages assigned in this tab.')
+            return
+        labels=[f"{i+1}. {p['title']}" for i,p in enumerate(pages)]
+        chosen_page, ok = QInputDialog.getItem(
+            self, 'Pages for reference', f'{len(pages)} matching page(s):',
+            labels, 0, False)
+        if ok:
+            self.select_page_id(pages[labels.index(chosen_page)]['id'])
+
+    def _research_tag_menu(self, menu, kind, identifier):
+        tag_menu = menu.addMenu('Research Tags')
+        tag_menu.addAction('Create and apply tag…',
+            lambda _=False, k=kind, ident=identifier:
+            self._research_create_tag(k, ident))
+        assigned = (effective_tags(self.project.research,
+                           self.project.page_groups, identifier) if kind == 'pages'
+                    else set(self.project.research['tag_assignments'][kind].get(identifier, [])))
+        for tid, item in self.project.research['tags'].items():
+            action = tag_menu.addAction(item['name'])
+            action.setCheckable(True)
+            action.setChecked(tid in assigned)
+            action.triggered.connect(
+                lambda checked, k=kind, ident=identifier, tag=tid:
+                self._research_toggle_tag(k, ident, tag, checked))
+
+    def _research_menu(self, menu, kind, identifier):
+        research_menu = menu.addMenu('Research · References & Tags')
+        research_menu.addAction('New reference…',
+            lambda _=False,k=kind,i=identifier:self._research_new_reference(k,i))
+        research_menu.addAction('Assign existing reference…',
+            lambda _=False,k=kind,i=identifier:self._research_choose_reference(k,i))
+        research_menu.addAction('Edit linked reference…',
+            lambda _=False,k=kind,i=identifier:self._research_edit_reference(k,i))
+        research_menu.addAction('Clear reference on this item',
+            lambda _=False,k=kind,i=identifier:self._research_clear_reference(k,i))
+        copy_menu = research_menu.addMenu('Copy Reference')
+        for title,style in (('In text · with printed page','intext-page'),
+                            ('In text · without page','intext'),
+                            ('Narrative · Author (year)','narrative'),
+                            ('Bibliography · formatted','bibliography')):
+            copy_menu.addAction(title,
+                lambda _=False, k=kind, i=identifier, mode=style:
+                self._research_copy(k,i,mode))
+        research_menu.addSeparator()
+        if kind == 'pages':
+            research_menu.addAction('Override printed page number…',
+                lambda _=False,i=identifier:self._research_set_page_number(i))
+        else:
+            research_menu.addAction('Bulk printed-page offset…',
+                lambda _=False,i=identifier:self._research_set_group_offset(i))
+        self._research_tag_menu(research_menu, kind, identifier)
+
     def group_context_menu(self, point):
         """Context options depend on whether a page or folder was clicked."""
         item = self.group_tree.itemAt(point)
@@ -5241,6 +5860,13 @@ class ProjectPane(QWidget):
                     self.remove_page if len(chosen) > 1
                     else (lambda _=False, pid=identifier: self.remove_page_ids_confirmed([pid])))
             menu.addSeparator()
+            if kind == 'page':
+                self._number_context_menu(menu, identifier)
+            self._research_menu(menu, 'groups' if kind == 'group' else 'pages', identifier)
+            menu.addSeparator()
+        menu.addAction('Find pages by research tag…', self._research_search_tags)
+        menu.addAction('Find pages by reference…', self._research_search_references)
+        menu.addSeparator()
         menu.addAction('New group…', lambda: self.create_page_group(root=True))
         menu.addAction('Group selected pages…', self.group_selected_pages)
         if group_id:
@@ -5357,7 +5983,9 @@ class ProjectPane(QWidget):
         self.canvas.set_page_bookmarked(bool(page and page.get('bookmark')),
                                          page.get('bookmark', '') if page else '')
         if page:
-            self.page_title.setText(page['title'])
+            self.page_title.setText(
+                getattr(self, '_number_display_rows', {}).get(page['id'], {}).get(
+                    'display_title', page['title']), original=page['title'])
             self.page_title._has_page = True
             self.page_position.setText(f'{self.pages_list.currentRow()+1:,} / {self.pages_list.count():,}')
         else:
@@ -5811,6 +6439,26 @@ class ProjectPane(QWidget):
                     self._clarity_applied_signature = signature
 
         start_task(self, worker, done, priority=-2)
+
+    def set_preview_reading_mode(self, mode):
+        """Re-decode only the visible cache image, retaining zoom and scroll.
+
+        The source raster exists on disk already. Neither PDFium nor the
+        importer is invoked. Any in-flight clarity worker gets invalidated
+        so it cannot overwrite the newly chosen appearance after the click.
+        """
+        mode = reading_mode(mode)
+        self._preview_reading_mode = mode
+        self.settings.setValue('previewReadingMode', mode)
+        self.canvas.set_reading_mode(mode)
+        if hasattr(self, 'preview_dark_action'):
+            self.preview_dark_action.setChecked(mode == 'smart')
+            self.preview_invert_action.setChecked(mode == 'inverted')
+        self._clarity_token += 1
+        self._clarity_applied_signature = None
+        if self._displayed_cache_path and self.current_page():
+            self.canvas.replace_quality_image(self._displayed_cache_path)
+            self._schedule_preview_clarity()
 
     def update_preview_clarity(self):
         """Preference changed: restore original JPEG before optional re-sharp."""
@@ -6313,6 +6961,9 @@ class ProjectPane(QWidget):
         if item is not None:
             self._bookmark_page_menu(menu, clicked_id)
             self._reading_page_menu(menu, clicked_id)
+            self._number_context_menu(menu, clicked_id)
+            self._research_menu(menu, 'pages', clicked_id)
+            menu.addSeparator()
         link = menu.addAction(f'↗ Link page in notes  ·  {docs_shortcut("page_link")}')
         link.setEnabled(self.current_page() is not None)
         link.triggered.connect(self.link_current_page)
@@ -8108,9 +8759,14 @@ class ProjectPane(QWidget):
         try:
             self.save()
         except Exception as exc:
-            # Keep dirty state and retry without repetitive modal dialogs.
-            self.statusMessage.emit(f'Autosave could not finish: {exc}')
-            self._save_timer.start()  # retry next minute
+            # Never endlessly retry a permanent unsafe-path or disk-conflict
+            # failure; retain the unsaved editor and show a persistent warning.
+            self.statusMessage.emit(f'Autosave blocked; work retained in memory: {exc}')
+            from .notebook_lock import NotebookExternallyModifiedError
+            permanent = (isinstance(exc, NotebookExternallyModifiedError)
+                         or 'Unsafe' in str(exc) or 'unsafe' in str(exc))
+            if not permanent:
+                self._save_timer.start()  # transient write failure only
         finally:
             self._saving_from_autosave = False
 
@@ -8135,7 +8791,7 @@ class ProjectPane(QWidget):
         self.project.notes_page_setup = copy.deepcopy(first['page_setup'])
         self.project.splitter_sizes = widths
         self.project.panel_order = list(self._panel_order)
-        self.project.save()  # tab-local v4 manifest; cached renders excluded
+        self.project.save()  # tab-local v5 manifest; cached renders excluded
         container_save = getattr(self, 'on_container_save', None)
         if container_save:
             container_save()  # incremental v5 SQLite commit, never reload QTextDocument
@@ -8366,6 +9022,21 @@ class MainWindow(QMainWindow):
                 if not self.settings.contains(key) and previous.contains(key):
                     self.settings.setValue(key, previous.value(key))
             self.settings.setValue('preferencesMigrated', True)
+        # Detect interrupted sessions before cleanup or reopening notebooks.
+        # A running process holds a file lock, so it must not look like a crash.
+        try:
+            from .safe_session import interrupted_sessions
+            self._startup_interrupted_sessions = interrupted_sessions()
+        except Exception:
+            logger.exception('Could not scan interrupted working sessions')
+            self._startup_interrupted_sessions = []
+        # Only prune intentionally closed, published, backed-up sessions.
+        try:
+            from .safe_session import cleanup_fully_published_sessions
+            cleanup_fully_published_sessions()
+        except Exception:
+            logger.exception('Could not prune old published working sessions')
+        self._voice_studio = None  # no microphone opened until explicit Record
         self.theme = self.settings.value('theme', 'pinbu-quilt')
         if self.theme not in THEME_NAMES:
             self.theme = 'pinbu-quilt'
@@ -8402,6 +9073,20 @@ class MainWindow(QMainWindow):
         # Replacing it later destroys those Qt children, leaving Python with
         # deleted QLabel/QProgressBar wrappers during tab and checkbox updates.
         self.setStatusBar(QStatusBar())
+        # Plain, permanent footer text. Never confetti for an automatic save.
+        # showMessage() is temporary; permanent widgets remain visible even if
+        # the user is importing, searching, or reading another status message.
+        self._autosave_footer = QLabel('Autosave · —', self.statusBar())
+        small_font = self._autosave_footer.font()
+        if small_font.pointSizeF() > 0:
+            small_font.setPointSizeF(max(8.0, small_font.pointSizeF() - 1))
+            self._autosave_footer.setFont(small_font)
+        self._autosave_footer.setToolTip(
+            'Autosave commits changes to the private local working copy. '
+            'Use Save to publish to your chosen notebook location.')
+        self.statusBar().addPermanentWidget(self._autosave_footer)
+        self._last_secondary_backup_error = None
+        self._last_primary_backup_error = None
         # One read summary across ALL tabs.  It is derived from each
         # tab's live pages, so an empty or closed tab cannot count twice.
         self._notebook_progress_label = QLabel('Notebook: 0 / 0')
@@ -8519,7 +9204,7 @@ class MainWindow(QMainWindow):
         except AttributeError:
             pass
         self.backup_timer = QTimer(self)
-        self.backup_timer.setInterval(10 * 60 * 1000)  # rotating snapshots every 10 min
+        self.backup_timer.setInterval(5 * 60 * 1000)  # SafeSave every 5 minutes
         self.backup_timer.timeout.connect(self._periodic_backup)
         paths = ([str(initial_path)] if initial_path is not None
                  else self.settings.value('openProjects', []))
@@ -8528,15 +9213,18 @@ class MainWindow(QMainWindow):
         startup_errors = []
         for path in paths[:1]:  # one notebook with internal tabs
             try:
-                self.show_notebook(Notebook.load(Path(path)))
+                self.show_notebook(Notebook.open_session(Path(path)))
             except Exception as exc:
                 # Never quietly open an empty notebook as though nothing
                 # happened. Tell the user which file failed to load.
                 logger.exception('Could not reopen previous notebook')
                 startup_errors.append((str(path), str(exc)))
         if self.notebook is None:
-            self.show_notebook(Notebook.create(Path.home() / 'Documents' / 'Pinbu Note',
-                                               'My First Notes', extension='.pinbunote'))
+            first = Notebook.create(Path.home() / 'Documents' / 'Pinbu Note',
+                                    'My First Notes', extension='.pinbunote')
+            first_path = first.path
+            first.close()
+            self.show_notebook(Notebook.open_session(first_path))
         self.change_tab()
         if startup_errors:
             file_path, problem = startup_errors[0]
@@ -8546,9 +9234,84 @@ class MainWindow(QMainWindow):
                     f'Pinbu Note could not reopen:\n{p}\n\n{e}\n\n'
                     'The original notebook has NOT been modified.\n'
                     'Use File → Open to retry or attempt recovery.'))
+        if self._startup_interrupted_sessions:
+            QTimer.singleShot(0, self._offer_crash_recovery)
+
+    def _offer_crash_recovery(self):
+        """After an abnormal exit, offer to restore the latest LOCAL save.
+
+        Never write recovered contents over the cloud-facing original.
+        'Not now' keeps every recovery file accessible through File menu.
+        """
+        from .safe_session import (interrupted_sessions, working_root,
+                                   acknowledge_interrupted_session)
+        try:
+            current = interrupted_sessions()
+        except Exception:
+            logger.exception('Could not refresh interrupted sessions')
+            return
+        original_paths = {x['working'] for x in self._startup_interrupted_sessions}
+        candidates = [x for x in current if x['working'] in original_paths]
+        if not candidates:
+            return
+        latest = candidates[0]
+        source = Path(latest['working'])
+        original = Path(latest['original'])
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle('Pinbu Note unexpectedly closed')
+        dialog.setText('Pinbu Note unexpectedly closed. Do you wish to recover?')
+        dialog.setInformativeText(
+            f'An earlier editing session for {original.name} did not close normally.\n\n'
+            'Pinbu can restore its latest locally saved working copy as a NEW notebook. '
+            'The original notebook will not be overwritten.\n\n'
+            'You can also recover it later via File → Recover Local Working Copy…')
+        recover = dialog.addButton('Recover Latest Save', QMessageBox.ButtonRole.AcceptRole)
+        later = dialog.addButton('Not Now', QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(later)
+        dialog.exec()
+        if dialog.clickedButton() is not recover:
+            for item in candidates:
+                try:
+                    acknowledge_interrupted_session(item)
+                except Exception:
+                    logger.exception('Could not acknowledge interrupted session')
+            return
+        # Documents may be redirected into OneDrive. Recovery copies belong
+        # in OS-local application data, independently of the cloud original.
+        dest_dir = working_root().parent / 'Recovered'
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            stem = source.stem + ' Recovered'
+            target = dest_dir / (stem + '.pinbunote')
+            number = 2
+            while target.exists():
+                target = dest_dir / (f'{stem} {number}.pinbunote')
+                number += 1
+            restored = Notebook.restore_copy(source, target)
+            # Now the recovery file itself is durable. Opening can fail for a
+            # separate reason, but no recovery bytes will be deleted.
+            acknowledge_interrupted_session(latest)
+            self.open_path(restored)
+            QMessageBox.information(
+                self, 'Recovery copy created',
+                f'Restored local work to:\n{restored}\n\n'
+                'Please inspect the notebook before publishing or deleting '
+                'any older recovery files.')
+        except Exception as exc:
+            logger.exception('Startup local recovery failed')
+            QMessageBox.warning(
+                self, 'Recovery could not finish',
+                f'{exc}\n\nThe original notebook and recovery data have been retained. '
+                'You can retry from File → Recover Local Working Copy…')
 
     def changeEvent(self, event):
         super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            fullscreen = getattr(self, 'fullscreen_action', None)
+            if fullscreen is not None:
+                with QSignalBlocker(fullscreen):
+                    fullscreen.setChecked(self.isFullScreen())
         if event.type() != QEvent.Type.WindowStateChange or not hasattr(self, 'tabs'):
             return
         minimised = bool(self.windowState() & Qt.WindowState.WindowMinimized)
@@ -8640,6 +9403,27 @@ class MainWindow(QMainWindow):
         if pane is not None:
             pane.select_page_id(page_id)
 
+    def toggle_fullscreen(self, checked=None):
+        """Fullscreen on Windows/Linux, preserving the original maximized state.
+
+        Qt's showNormal() does not by itself remember whether the window was
+        maximized before entering fullscreen. Remember that state once, so
+        F11 toggling never unexpectedly leaves the app in a small window.
+        """
+        if checked is None:
+            checked = not self.isFullScreen()
+        if checked and not self.isFullScreen():
+            self._before_fullscreen_maximized = self.isMaximized()
+            self.showFullScreen()
+        elif not checked and self.isFullScreen():
+            self.showNormal()
+            if getattr(self, '_before_fullscreen_maximized', False):
+                self.showMaximized()
+        action = getattr(self, 'fullscreen_action', None)
+        if action is not None:
+            with QSignalBlocker(action):
+                action.setChecked(self.isFullScreen())
+
     def configure_actions(self):
         file_menu = self.menuBar().addMenu('&File')
         new = self.action('New Project…', self.new_project, QKeySequence.StandardKey.New)
@@ -8668,7 +9452,9 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.action('Import Older Project Folder…', self.import_legacy_project))
         file_menu.addAction(self.action('Close Project', self.close_current, QKeySequence.StandardKey.Close))
-        file_menu.addAction(self.action('Restore Backup As…', self.restore_backup))
+        file_menu.addAction(self.action('Restore From Backup…', self.restore_backup))
+        file_menu.addAction(self.action('Export Portable Backup…', self.export_portable_backup))
+        file_menu.addAction(self.action('Recover Local Working Copy…', self.recover_local_working_copy))
         file_menu.addSeparator()
         file_menu.addAction(self.action('Quit Pinbu Note', self.close,
                                         QKeySequence.StandardKey.Quit))
@@ -8694,6 +9480,7 @@ class MainWindow(QMainWindow):
         edit.addAction(self.action(f'Insert Link to Selected Page  ·  {docs_shortcut("page_link")}', lambda: self.active() and self.active().link_current_page()))
         edit.addAction(self.action('Remove Selected Pages', lambda: self.active() and self.active().remove_page()))
         edit.addAction(self.action('Focus Notes', lambda: self.active() and self.active().notes.focus_notes()))
+        edit.addAction(self.action('Voice Studio · Dictation / Lecture…', self.show_voice_studio))
         edit.addAction(self.action('Repair Notes Line Spacing…', self.repair_notes_line_spacing))
         edit.addSeparator()
         edit.addAction(self.action('Find in Notes…',
@@ -8714,6 +9501,13 @@ class MainWindow(QMainWindow):
             lambda: self.active() and self.active().notes.insert_horizontal_line()))
 
         view = self.menuBar().addMenu('&View')
+        if not IS_MAC:
+            self.fullscreen_action = view.addAction('Fullscreen  ·  F11')
+            self.fullscreen_action.setCheckable(True)
+            self.fullscreen_action.setShortcut(QKeySequence('F11'))
+            self.fullscreen_action.setChecked(self.isFullScreen())
+            self.fullscreen_action.triggered.connect(self.toggle_fullscreen)
+            view.addSeparator()
         self.navigator_visibility_action = view.addAction('Show Page Navigator')
         self.navigator_visibility_action.setCheckable(True)
         self.navigator_visibility_action.setChecked(
@@ -8751,6 +9545,9 @@ class MainWindow(QMainWindow):
         options.addAction(self.action('Notes Page Setup…',
             lambda: self.active() and self.active().show_notes_page_setup()))
         help_menu = self.menuBar().addMenu('&Help')
+        help_menu.addAction(self.action('Keyboard Shortcuts…',
+                                        self.show_keyboard_shortcuts, 'F1'))
+        help_menu.addSeparator()
         help_menu.addAction(self.action('About Pinbu Note', self.show_about))
 
         # All header actions wrap instead of disappearing behind toolbar overflow.
@@ -8908,6 +9705,44 @@ class MainWindow(QMainWindow):
         widget = self.tabs.currentWidget()
         return widget if isinstance(widget, ProjectPane) else None
 
+    def _warn_if_newer_original(self):
+        """Autosave remains local; alert ONCE if cloud original needs newer app.
+
+        A sleeping device can wake after Dropbox synchronised an upgraded
+        notebook. Routine autosave is never allowed to publish over it, and
+        the user needs a clear warning rather than silent background retries.
+        """
+        from .notebook_lock import disk_signature
+        from .safe_overwrite import read_destination_info
+        nb = self.notebook
+        if nb is None or not getattr(nb, '_origin_path', None):
+            return
+        signature = disk_signature(nb._origin_path)
+        if signature is None or signature == nb._origin_signature:
+            return
+        if getattr(nb, '_newer_origin_warning_signature', None) == signature:
+            return
+        try:
+            info = read_destination_info(nb._origin_path)
+            if not info.newer_application:
+                return
+            message = (f'The original notebook was saved by newer Pinbu Note '
+                       f'v{info.app_version}. Some features may not work '
+                       'correctly in your older version.\n\nWe strongly '
+                       'recommend upgrading Pinbu Note or saving a NEW copy. '
+                       'Your local autosave will continue safely, but publishing '
+                       'over the original is blocked. No original was overwritten.')
+        except NotebookNewerVersionError as exc:
+            # An unsupported future notebook format is even more dangerous.
+            message = (f'{exc}\n\nLocal autosave continues; the external '
+                       'notebook will NOT be overwritten.')
+        except (OSError, ValueError):
+            # A temporarily syncing file should not produce a false newer-
+            # version alert. Ordinary publish-signature checks still apply.
+            return
+        nb._newer_origin_warning_signature = signature
+        QMessageBox.warning(self, 'Notebook from newer Pinbu Note — update recommended', message)
+
     def _on_pane_container_save(self, pane):
         """Only idle autosaves use the worker; structural edits stay atomic."""
         notebook = self.notebook
@@ -8921,9 +9756,23 @@ class MainWindow(QMainWindow):
             return
         if (getattr(pane, '_saving_from_autosave', False)
                 and not self._changing_notebook):
+            self._warn_if_newer_original()
             self._queue_background_notebook_save((pane,))
         else:
             notebook.save()
+
+    def _set_autosave_footer(self, message=None, error=None):
+        """The discreet permanent footer indicator; no transient animation."""
+        if error:
+            self._autosave_footer.setText('Autosave · failed')
+            self._autosave_footer.setToolTip(
+                'Local autosave failed. Work may still exist only in memory. '
+                'Do not close until you have secured a recovery copy.\n' + str(error))
+        else:
+            label = message or ('Autosave · ' + datetime.now().strftime('%H:%M'))
+            self._autosave_footer.setText(label)
+            self._autosave_footer.setToolTip(
+                'Latest local working-copy save. Use Save to publish to the original notebook.')
 
     def _queue_background_notebook_save(self, panes):
         """Coalesce idle saves and never pass a Qt widget to the worker."""
@@ -8946,7 +9795,8 @@ class MainWindow(QMainWindow):
                 raise
             # Never allocate hundreds of MB merely to save in the background.
             # Rare oversized notebooks still use the proven synchronous path.
-            notebook.save()
+            if notebook.save():
+                self._set_autosave_footer()
             return
         ticket = {'notebook': notebook, 'panes': tuple(panes)}
         self._background_save_ticket = ticket
@@ -8966,14 +9816,21 @@ class MainWindow(QMainWindow):
             if notebook is not self.notebook or notebook._closed:
                 return
             if error:
-                for pane in set(ticket['panes']) | set(pending):
-                    if not pane._closed:
-                        pane.schedule_save()
+                from .notebook_lock import NotebookExternallyModifiedError
+                permanent = (isinstance(error, NotebookExternallyModifiedError)
+                             or 'Unsafe' in str(error) or 'unsafe' in str(error))
+                if not permanent:
+                    for pane in set(ticket['panes']) | set(pending):
+                        if not pane._closed:
+                            pane.schedule_save()
+                self._set_autosave_footer(error=error)
                 self.statusBar().showMessage(
-                    f'Background autosave failed; will retry: {error}', 6000)
+                    f'Autosave blocked: {error}' if permanent else
+                    f'Background autosave failed; will retry: {error}',
+                    0 if permanent else 6000)
                 return
             if notebook.accept_background_save(result) and result.changed:
-                self.statusBar().showMessage('Notebook autosaved ♡', 1600)
+                self._set_autosave_footer()
             if pending:
                 # Other panes finished their JSON snapshots during this write.
                 # Their edits must get their own *later* SQLite commit.
@@ -9011,8 +9868,12 @@ class MainWindow(QMainWindow):
                 pane.save()
                 saved.append(pane)
             self._batching_pane_saves = False
-            return notebook.save()
-        except Exception:
+            changed = notebook.save()
+            if changed:
+                self._set_autosave_footer()
+            return changed
+        except Exception as exc:
+            self._set_autosave_footer(error=exc)
             # pane.save() clears _dirty only after its manifest succeeds; the
             # enclosing SQLite transaction may still fail. A retry must not
             # silently omit those editors' recent changes.
@@ -9156,6 +10017,8 @@ class MainWindow(QMainWindow):
         pane.pages_list.notebook_id = self.notebook.identifier
         pane.group_tree.tab_id = tab['id']
         pane.group_tree.notebook_id = self.notebook.identifier
+        pane._load_number_display_overrides()
+        pane._refresh_number_labels()
         pane.pages_list.pagesPasted.connect(self._transfer_tab_pages)
         pane.on_container_save = lambda p=pane: self._on_pane_container_save(p)
         pane.statusMessage.connect(self.statusBar().showMessage)
@@ -9182,6 +10045,12 @@ class MainWindow(QMainWindow):
         but a worker may still be reading their original PDFs.  Keep both
         the widgets and workspace alive until the task completion is delivered.
         """
+        # This path is reached only after the old notebook's final snapshot
+        # was verified. Record an intentional close now rather than waiting
+        # for the deferred worker-retirement timer (which may never fire if
+        # the entire application quits immediately afterwards).
+        from .safe_session import mark_normal_close
+        mark_normal_close(notebook)
         for pane in panes:
             if pane._active:
                 pane.deactivate()
@@ -9216,8 +10085,19 @@ class MainWindow(QMainWindow):
                     pane = self.tabs.widget(i)
                     if pane._importing:
                         raise RuntimeError('Finish importing before switching projects.')
-                self._save_panes_in_one_commit(
-                    self.tabs.widget(i) for i in range(self.tabs.count()))
+                try:
+                    self._save_panes_in_one_commit(
+                        self.tabs.widget(i) for i in range(self.tabs.count()))
+                    self._backup_before_close(self.notebook)
+                except Exception as exc:
+                    if notebook is not self.notebook:
+                        notebook.close()
+                    raise CurrentNotebookSaveError(
+                        'Your CURRENT notebook could not be saved safely, so '
+                        'Pinbu has not switched notebooks.\n\n' + str(exc) +
+                        '\n\nYour target notebook is not necessarily damaged. '
+                        'Recover the missing document or restore your current '
+                        'notebook from its last verified backup.') from exc
                 for i in range(self.tabs.count()):
                     self.tabs.widget(i).deactivate()
                     self.tabs.widget(i)._closed = True
@@ -9239,11 +10119,19 @@ class MainWindow(QMainWindow):
             self._refresh_tab_buttons()
         finally:
             self._changing_notebook = False
-        self.record_recent(notebook.path)
+        self.record_recent(notebook.display_path)
         self.apply_theme()
+        if notebook._origin_path is not None:
+            self.statusBar().showMessage(
+                'Working locally · Ctrl+S / Cmd+S publishes to the original', 5500)
         self._update_notebook_progress(animate=False)
         self.change_tab()
         self.save_open_tabs()
+        self._set_autosave_footer('Autosave · ready')
+        self._last_secondary_backup_error = str(self.settings.value(
+            self._secondary_backup_error_key(notebook), '') or '') or None
+        self._last_primary_backup_error = str(self.settings.value(
+            self._primary_backup_error_key(notebook), '') or '') or None
         self.backup_timer.start()
 
     def eventFilter(self, watched, event):
@@ -9604,15 +10492,23 @@ class MainWindow(QMainWindow):
         Recovery is opt-in. Invalid annotations may be skipped,
         but the source notebook is left exactly as it was.
         """
-        if self.notebook and Path(path).expanduser().resolve() == self.notebook.path:
+        if self.notebook and Path(path).expanduser().resolve() == self.notebook.display_path:
             self.statusBar().showMessage('This notebook is already open in this window.', 3500)
             return
         try:
-            notebook = Notebook.load(Path(path))
+            notebook = Notebook.open_session(Path(path))
             self.show_notebook(notebook)
+        except CurrentNotebookSaveError as exc:
+            QMessageBox.warning(self, 'Current notebook prevented switching', str(exc))
+            return  # Do not offer recovery for the NEW notebook.
         except NotebookInUseError as exc:
             QMessageBox.warning(self, 'Notebook already open', str(exc))
             return  # Do not offer destructive/duplicate recovery for a live notebook.
+        except NotebookNewerVersionError as exc:
+            QMessageBox.warning(self, 'Notebook created by newer Pinbu Note',
+                f'{exc}\n\nThe original has NOT been changed. Update the app '
+                'before editing, and keep a separate copy for safety.')
+            return
         except Exception as exc:
             logger.exception('Could not open notebook')
             answer = QMessageBox.question(
@@ -9649,7 +10545,10 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, 'New Pinbu Note project', 'Project name:', text='New Study Project')
         if ok and name.strip():
             try:
-                notebook = Notebook.create(Path(folder), name, extension='.pinbunote')
+                created = Notebook.create(Path(folder), name, extension='.pinbunote')
+                path = created.path
+                created.close()
+                notebook = Notebook.open_session(path)
                 self.settings.setValue('lastSaveDir', folder)
                 self.show_notebook(notebook)
             except Exception as exc:
@@ -9673,18 +10572,38 @@ class MainWindow(QMainWindow):
         if pane and self.notebook:
             try:
                 changed = bool(pane._celebrate_on_next_manual_save)
-                self._save_panes_in_one_commit((pane,))
-                self.settings.setValue('lastSaveDir', str(self.notebook.path.parent))
+                self._save_panes_in_one_commit(
+                    self.tabs.widget(i) for i in range(self.tabs.count()))
+                # Only this explicit Save writes to the chosen original.
+                self.notebook.publish()
+                self.settings.setValue('lastSaveDir', str(self.notebook.display_path.parent))
+                self.settings.setValue(self._publish_health_key(),
+                                       datetime.now(timezone.utc).isoformat())
                 if changed:
                     pane._celebrate_on_next_manual_save = False
-                    self.statusBar().showMessage('Notes saved locally!', 3500)
+                    self.statusBar().showMessage('Saved locally and published to original!', 3500)
                     self.save_toast.show_for(self.root.rect())
                     self.save_confetti.celebrate(self.root.rect(),
                         str(self.settings.value('reducedMotion', 'false')).lower() == 'true')
                 else:
-                    self.statusBar().showMessage('Already saved · no new changes ♡', 2500)
+                    self.statusBar().showMessage('Saved locally and published to original ♡', 2500)
+            except NotebookNewerVersionError as exc:
+                QMessageBox.warning(self, 'Newer Pinbu version — update recommended',
+                    f'{exc}\n\nLocal edits and recovery backups are preserved. '
+                    'Please upgrade Pinbu Note, or use Save Copy As with a new filename.')
+            except NotebookExternallyModifiedError as exc:
+                QMessageBox.warning(self, 'Publishing blocked — your local copy is safe',
+                    f'{exc}\n\nPinbu has NOT replaced the external notebook. '
+                    'Use File → Save Copy As… to preserve both versions.')
             except Exception as exc:
-                QMessageBox.critical(self, 'Save failed', str(exc))
+                if 'missing or unsafe page asset' in str(exc):
+                    QMessageBox.warning(self, 'Source document missing — save blocked',
+                        f'{exc}\n\nPinbu has not published an incomplete notebook. '
+                        'Please keep the app open and restore the missing asset '
+                        'from a previous backup, or reimport its source file. '
+                        'Your original notebook has not been overwritten.')
+                else:
+                    QMessageBox.critical(self, 'Save failed', str(exc))
 
     def export_clean_notebook(self):
         """Export a privacy-cleaned copy without modifying the original.
@@ -9991,22 +10910,84 @@ class MainWindow(QMainWindow):
             self.active().choose_files()
 
     def save_copy_as(self):
+        """Save an independent copy; replace ONLY after backup + confirmation."""
         if not self.notebook:
             return
-        self._save_current_tab()
-        self.notebook.save()
-        target, _ = QFileDialog.getSaveFileName(self, 'Save project copy',
-            str(self.notebook.path.with_name(self.notebook.path.stem + ' Copy.pinbunote')),
-            'Pinbu Note Notebook (*.pinbunote *.yomunote)')
-        if target:
+        from .safe_overwrite import read_destination_info, save_copy_as as guarded_copy
+        try:
+            # Commit ALL tabs before copying, not just the active notes editor.
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count()))
+        except Exception as exc:
+            QMessageBox.warning(self, 'Cannot save copy safely', str(exc))
+            return
+        suggestion = str(self.notebook.display_path.with_name(
+            self.notebook.display_path.stem + ' Copy.pinbunote'))
+        for _ in range(10):
+            target, _ = QFileDialog.getSaveFileName(
+                self, 'Save project copy', suggestion,
+                'Pinbu Note Notebook (*.pinbunote *.yomunote)')
+            if not target:
+                return
+            dest = Path(target)
             try:
-                dest = Path(target)
+                if dest.resolve() in (self.notebook.path.resolve(),
+                                      self.notebook.display_path.resolve()):
+                    raise ValueError('This is your currently open notebook. '
+                                     'Use Save to publish to it, or choose another filename.')
+                overwrite_newer = False
                 if dest.exists():
-                    raise FileExistsError('Choose a new file name to protect your existing project.')
-                Notebook.restore_copy(self.notebook.path, dest)
-                self.open_path(dest)
+                    info = read_destination_info(dest)
+                    confirm = QMessageBox(self)
+                    confirm.setIcon(QMessageBox.Icon.Warning)
+                    confirm.setWindowTitle('Overwrite existing notebook?')
+                    if info.newer_application:
+                        confirm.setText(
+                            f'This notebook was saved by NEWER Pinbu Note v{info.app_version}.')
+                        confirm.setInformativeText(
+                            f'You are using v{__version__}. Some newer features '
+                            'and annotations may be lost if you overwrite it. '
+                            'We STRONGLY recommend saving a NEW copy instead. '
+                            'If you choose to overwrite anyway, Pinbu will '
+                            'first make and verify a local pre-overwrite backup.')
+                    else:
+                        confirm.setText('An existing notebook already has that filename.')
+                        confirm.setInformativeText(
+                            'Would you like to save as a new copy instead? '
+                            'If you overwrite, Pinbu will first make and verify '
+                            'a backup of the existing destination notebook.')
+                    new_copy = confirm.addButton('Save as New Copy', QMessageBox.ButtonRole.AcceptRole)
+                    replace = confirm.addButton('Overwrite After Backup', QMessageBox.ButtonRole.DestructiveRole)
+                    cancel = confirm.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+                    confirm.setDefaultButton(new_copy)
+                    confirm.exec()
+                    choice = confirm.clickedButton()
+                    if choice is cancel or choice not in (new_copy, replace):
+                        return
+                    if choice is new_copy:
+                        suggestion = str(dest.with_name(dest.stem + ' New Copy.pinbunote'))
+                        continue
+                    overwrite_newer = info.newer_application
+                directory = Path(str(self.settings.value(
+                    'backupDirectory', default_backup_folder())))
+                output, pre_overwrite = guarded_copy(
+                    self.notebook.path, dest, backup_directory=directory,
+                    allow_newer_application=overwrite_newer,
+                    protected_paths=(self.notebook.display_path,))
+                if pre_overwrite:
+                    QMessageBox.information(
+                        self, 'Existing notebook safely backed up',
+                        'The previous destination was preserved in its OWN '
+                        f'project backup history before overwriting.\n\n{pre_overwrite}')
+                self.open_path(output)
+                return
+            except NotebookNewerVersionError as exc:
+                QMessageBox.warning(self, 'Newer notebook — upgrade recommended',
+                                    f'{exc}\n\nPlease save a new copy instead.')
+                suggestion = str(dest.with_name(dest.stem + ' New Copy.pinbunote'))
             except Exception as exc:
-                QMessageBox.warning(self, 'Copy failed', str(exc))
+                QMessageBox.warning(self, 'Copy failed — original preserved', str(exc))
+                return
 
     def close_tab(self, index):
         if 0 <= index < self.tabs.count():
@@ -10025,6 +11006,13 @@ class MainWindow(QMainWindow):
             # active editor; one complete SQLite commit before retiring them.
             self._save_panes_in_one_commit(
                 self.tabs.widget(i) for i in range(self.tabs.count()))
+            try:
+                self._backup_before_close(self.notebook)
+            except Exception as exc:
+                QMessageBox.warning(self, 'Cannot close safely',
+                    f'Pinbu could not verify the final local backup:\n{exc}\n\n'
+                    'The notebook remains open.')
+                return
             self._changing_notebook = True
             try:
                 old = self.notebook
@@ -10042,47 +11030,366 @@ class MainWindow(QMainWindow):
             finally:
                 self._changing_notebook = False
             self.setWindowTitle('Pinbu Note')
+            self._set_autosave_footer('Autosave · —')
             self._update_notebook_progress(animate=False)
 
     def save_open_tabs(self):
-        self.settings.setValue('openProjects', [str(self.notebook.path)] if self.notebook else [])
+        self.settings.setValue('openProjects', [str(self.notebook.display_path)] if self.notebook else [])
+
+    def _publish_health_key(self):
+        path = str(self.notebook.display_path) if self.notebook else ''
+        digest = hashlib.sha256(path.encode('utf-8')).hexdigest()[:24]
+        return f'safeSave/lastPublish/{digest}'
+
+    def _secondary_backup_error_key(self, notebook):
+        digest = hashlib.sha256(str(notebook.display_path).encode('utf-8')).hexdigest()[:24]
+        return f'safeSave/lastSecondaryError/{digest}'
+
+    def _primary_backup_error_key(self, notebook):
+        digest = hashlib.sha256(str(notebook.display_path).encode('utf-8')).hexdigest()[:24]
+        return f'safeSave/lastPrimaryError/{digest}'
+
+    def _backup_destinations(self):
+        """Return primary and optional secondary roots without writing files."""
+        primary = Path(str(self.settings.value('backupDirectory', default_backup_folder()))).expanduser()
+        secondary = None
+        if str(self.settings.value('secondaryBackupEnabled', 'false')).lower() == 'true':
+            configured = str(self.settings.value('secondaryBackupDirectory', '')).strip()
+            if not configured:
+                raise ValueError('Choose a second backup folder in Preferences, or turn it off.')
+            secondary = Path(configured).expanduser()
+        from .backup_health import distinct_backup_paths
+        if secondary is not None and not distinct_backup_paths(primary, secondary):
+            raise ValueError('The second backup must be outside the primary backup folder.')
+        return primary, secondary
+
+    def _backup_to_both(self, notebook, *, force=False, reason='automatic'):
+        from .backup_health import (backup_to_destinations,
+                                    SecondaryBackupError, PrimaryBackupError)
+        primary, secondary = self._backup_destinations()
+        count = int(self.settings.value('backupCount', 100))
+        try:
+            outputs = backup_to_destinations(
+                notebook, primary, secondary, limit=count, force=force, reason=reason)
+            self._last_secondary_backup_error = None
+            self._last_primary_backup_error = None
+            self.settings.remove(self._secondary_backup_error_key(notebook))
+            self.settings.remove(self._primary_backup_error_key(notebook))
+            return outputs
+        except SecondaryBackupError as exc:
+            self._last_secondary_backup_error = str(exc)
+            self._last_primary_backup_error = None
+            self.settings.remove(self._primary_backup_error_key(notebook))
+            self.settings.setValue(self._secondary_backup_error_key(notebook), str(exc))
+            logger.warning('Secondary SafeSave backup failed: %s', exc)
+            raise
+        except PrimaryBackupError as exc:
+            self._last_primary_backup_error = str(exc)
+            self.settings.setValue(self._primary_backup_error_key(notebook), str(exc))
+            if exc.secondary_snapshot is not None:
+                self._last_secondary_backup_error = None
+                self.settings.remove(self._secondary_backup_error_key(notebook))
+            elif exc.secondary_error is not None:
+                self._last_secondary_backup_error = str(exc.secondary_error)
+                self.settings.setValue(self._secondary_backup_error_key(notebook),
+                                       self._last_secondary_backup_error)
+            logger.error('Primary SafeSave backup failed: %s', exc)
+            raise
+
+    def _backup_before_close(self, notebook):
+        """Primary close backup is required; secondary failure is disclosed."""
+        from .backup_health import SecondaryBackupError, PrimaryBackupError
+        try:
+            primary, secondary = self._backup_to_both(notebook, force=True, reason='close')
+        except PrimaryBackupError as exc:
+            if not exc.secondary_snapshot or not exc.secondary_snapshot.is_file():
+                raise IOError('The primary backup failed and no new secondary '
+                              'close snapshot could be confirmed.') from exc
+            question = QMessageBox(self)
+            question.setIcon(QMessageBox.Icon.Warning)
+            question.setWindowTitle('Primary backup folder unavailable')
+            question.setText('The PRIMARY backup failed, but the SECOND backup succeeded.')
+            question.setInformativeText(
+                str(exc.reason) + '\n\nPinbu can continue using the second '
+                'independent backup, or stay open so you can repair the primary folder.')
+            proceed = question.addButton('Continue', QMessageBox.ButtonRole.AcceptRole)
+            stay = question.addButton('Stay Open', QMessageBox.ButtonRole.RejectRole)
+            question.setDefaultButton(stay)
+            question.exec()
+            if question.clickedButton() is not proceed:
+                raise IOError('Close cancelled because the primary backup failed.') from exc
+            return exc.secondary_snapshot
+        except SecondaryBackupError as exc:
+            # The primary already exists. Never claim both succeeded. Give the
+            # user a conscious choice, not an uncloseable app or silent error.
+            if not exc.primary_snapshot or not exc.primary_snapshot.is_file():
+                raise IOError('Could not confirm the primary close backup.') from exc
+            question = QMessageBox(self)
+            question.setIcon(QMessageBox.Icon.Warning)
+            question.setWindowTitle('Second backup folder unavailable')
+            question.setText('The primary local backup succeeded, but the second backup failed.')
+            question.setInformativeText(
+                str(exc.reason) + '\n\nYour primary backup remains safe. '
+                'You can continue closing, or stay open to fix the second destination.')
+            proceed = question.addButton('Continue', QMessageBox.ButtonRole.AcceptRole)
+            stay = question.addButton('Stay Open', QMessageBox.ButtonRole.RejectRole)
+            question.setDefaultButton(stay)
+            question.exec()
+            if question.clickedButton() is not proceed:
+                raise IOError('Close cancelled because the second backup failed.') from exc
+            return exc.primary_snapshot
+        if primary is None or not primary.is_file():
+            raise IOError('Close backup was not committed. The notebook remains open.')
+        if secondary is not None and not secondary.is_file():
+            raise IOError('Second close backup was not committed.')
+        return primary
 
     def _periodic_backup(self):
-        """Every 10 min, snapshot only if changed since the previous backup."""
+        """Five-minute independent snapshots; failed secondary never reads as healthy."""
         if not self.notebook or self._exchange_busy:
-            return  # The exchange owns the notebook manifest until it finishes.
+            return
+        from .backup_health import SecondaryBackupError
         try:
-            pane = self.active()
-            if pane and pane._dirty:
-                self._save_panes_in_one_commit((pane,))
-            else:
-                self.notebook.save()
-            if self.notebook.backup_dirty:
-                directory = Path(str(self.settings.value('backupDirectory', default_backup_folder())))
-                limit = int(self.settings.value('backupCount', 30))
-                output = self.notebook.backup(directory, limit)
-                if output:
-                    self.statusBar().showMessage('Quiet recovery backup saved ♡', 2400)
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count()))
+            primary, secondary = self._backup_to_both(self.notebook, reason='automatic')
+            self._warn_if_newer_original()
+            if primary or secondary:
+                self.statusBar().showMessage('Five-minute backup completed', 2400)
+        except SecondaryBackupError as exc:
+            self._warn_if_newer_original()
+            self.statusBar().showMessage(
+                'Secondary backup FAILED — primary local backup retained. '
+                'Check Preferences → SafeSave Health.', 0)
         except Exception as exc:
-            self.statusBar().showMessage(f'Backup could not finish: {exc}', 5500)
+            self.statusBar().showMessage(f'SafeSave backup failed: {exc}', 0)
+
+    def show_backup_health(self):
+        """Non-destructive health dashboard. Full verification runs off the GUI thread."""
+        from .backup_health import inspect_store, verify_history
+        dialog = QDialog(self)
+        dialog.setWindowTitle('SafeSave Health · Pinbu Note')
+        dialog.resize(610, 470)
+        layout = QVBoxLayout(dialog)
+        explanation = QLabel(
+            'Backup Health checks both destinations separately. '
+            'Verification reads stored assets and restores a temporary notebook; '
+            'it never changes your original.')
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        report = QPlainTextEdit(dialog)
+        report.setReadOnly(True)
+        report.setPlainText('Checking backup folders…')
+        layout.addWidget(report, 1)
+        controls = QHBoxLayout()
+        refresh = QPushButton('Refresh Health')
+        verify = QPushButton('Verify Latest Backup')
+        verify_all = QPushButton('Verify Entire History…')
+        controls.addWidget(refresh)
+        controls.addWidget(verify)
+        controls.addWidget(verify_all)
+        layout.addLayout(controls)
+        done = QPushButton('Close')
+        done.clicked.connect(dialog.accept)
+        layout.addWidget(done)
+        current = self.notebook
+        if not current:
+            report.setPlainText('No notebook is open. Open a notebook to inspect its backup history.')
+            refresh.setEnabled(False)
+            verify.setEnabled(False)
+            verify_all.setEnabled(False)
+            dialog.exec()
+            return
+        try:
+            primary, secondary = self._backup_destinations()
+        except ValueError as exc:
+            report.setPlainText('Backup destination configuration error: ' + str(exc))
+            verify.setEnabled(False)
+            verify_all.setEnabled(False)
+            dialog.exec()
+            return
+        source = Path(current.display_path)
+        identity, title = current.identifier, current.name
+        working = Path(current.path)
+        published = str(self.settings.value(self._publish_health_key(), '') or '')
+        last_secondary_error = self._last_secondary_backup_error
+        last_primary_error = self._last_primary_backup_error
+        busy = False
+
+        def start(mode):
+            nonlocal busy
+            if busy:
+                return
+            busy = True
+            for btn in (refresh, verify, verify_all):
+                btn.setEnabled(False)
+            report.setPlainText('Verifying backup history in the background…'
+                                if mode != 'refresh' else 'Inspecting backup storage…')
+
+            def worker():
+                roots = [('Primary', primary)]
+                if secondary:
+                    roots.append(('Secondary', secondary))
+                stores = [(label, inspect_store(root, identity, title, source))
+                          for label, root in roots]
+                verified = []
+                if mode != 'refresh':
+                    for label, health in stores:
+                        if health.error:
+                            raise IOError(f'{label} backup directory: {health.error}')
+                        if health.marker and health.snapshot_count:
+                            result = verify_history(
+                                Path(health.marker), all_snapshots=(mode == 'all'))
+                            verified.append(f'{label}: verified {result[0]}/{result[1]} '
+                                            'snapshot(s), including a complete test restore')
+                        else:
+                            verified.append(f'{label}: no snapshots available to verify')
+                return stores, verified
+
+            def finished(result, error):
+                nonlocal busy
+                busy = False
+                if not dialog.isVisible():
+                    return
+                for btn in (refresh, verify, verify_all):
+                    btn.setEnabled(True)
+                if error:
+                    report.setPlainText(f'Backup check FAILED:\n{error}\n\n'
+                                        'No original notebook was modified.')
+                    return
+                stores, verified = result
+                lines = ['SafeSave Health · ' + title, '']
+                try:
+                    mtime = datetime.fromtimestamp(working.stat().st_mtime).astimezone()
+                    lines.append('Local working copy last modified: '
+                                 + mtime.strftime('%Y-%m-%d %H:%M:%S'))
+                except OSError:
+                    lines.append('Local working copy: unavailable')
+                lines.append('Original notebook: ' + str(source))
+                lines.append('Last successful Save to original (this Pinbu installation): '
+                             + (published or 'Not recorded'))
+                lines.append('Unpublished local changes: '
+                             + ('Yes' if current._unpublished else 'No'))
+                if last_primary_error:
+                    lines.append('Latest primary backup problem: ' + last_primary_error)
+                if last_secondary_error:
+                    lines.append('Latest secondary backup problem: ' + last_secondary_error)
+                for label, h in stores:
+                    lines += ['', label + ' backup folder: ' + h.destination]
+                    if h.error:
+                        lines.append('ERROR: ' + h.error)
+                    elif not h.marker:
+                        lines.append('No backup archive found yet')
+                    else:
+                        lines.append('Snapshots: ' + str(h.snapshot_count))
+                        lines.append('Newest snapshot: ' + (h.latest or 'None'))
+                        lines.append('Disk use: ' + f'{h.bytes_used/1048576:.1f} MiB')
+                if secondary is None:
+                    lines += ['', 'Second backup destination: Disabled (optional)']
+                if verified:
+                    lines += ['', 'Verification results:', *verified]
+                else:
+                    lines += ['', 'Integrity: Not verified in this session. '
+                              'Use one of the verification buttons.']
+                report.setPlainText('\n'.join(lines))
+
+            start_task(self, worker, finished, priority=-1)
+
+        refresh.clicked.connect(lambda: start('refresh'))
+        verify.clicked.connect(lambda: start('latest'))
+        verify_all.clicked.connect(lambda: start('all'))
+        start('refresh')
+        dialog.exec()
 
     def restore_backup(self):
+        """Restore a selected snapshot to a new, separately named notebook."""
+        from .safe_backup import list_snapshots, restore_snapshot
         folder = str(self.settings.value('backupDirectory', default_backup_folder()))
-        original, _ = QFileDialog.getOpenFileName(self, 'Select a Pinbu Note or older Yomu Note recovery backup', folder,
-                                                  'Pinbu Note Notebooks (*.pinbunote *.yomunote *.yominote)')
+        original, _ = QFileDialog.getOpenFileName(
+            self, 'Select project history.pinbubackup or portable backup', folder,
+            'Pinbu Backup Archives (*.pinbubackup);;Legacy Notebook Backups (*.pinbunote *.yomunote *.yominote)')
         if not original:
             return
-        suggested = str((self.notebook.path if self.notebook else Path(folder)/'Recovered.pinbunote')
-                         .with_name('Recovered ' + Path(original).stem + '.pinbunote'))
-        destination, _ = QFileDialog.getSaveFileName(self, 'Restore backup to a NEW project file',
-            suggested, 'Pinbu Note Notebook (*.pinbunote *.yomunote)')
-        if not destination:
-            return
         try:
-            output = Notebook.restore_copy(Path(original), Path(destination))
+            is_archive = Path(original).suffix.lower() == '.pinbubackup'
+            selected_id = None
+            if is_archive:
+                snapshots = list_snapshots(Path(original))
+                if not snapshots:
+                    raise ValueError('There are no readable snapshots in that backup.')
+                labels = [f"{item['timestamp']}  |  {item['reason']}  |  Pinbu {item['app_version']}"
+                          for item in snapshots]
+                label, accepted = QInputDialog.getItem(
+                    self, 'Select recovery version', 'Which snapshot would you like to restore?',
+                    labels, 0, False)
+                if not accepted:
+                    return
+                selected_id = snapshots[labels.index(label)]['id']
+            basename = Path(original).stem
+            suggested = str(Path.home() / 'Documents' / (basename + ' Recovered.pinbunote'))
+            destination, _ = QFileDialog.getSaveFileName(
+                self, 'Restore backup to a NEW notebook', suggested,
+                'Pinbu Note Notebook (*.pinbunote)')
+            if not destination:
+                return
+            if is_archive:
+                output = restore_snapshot(Path(original), Path(destination),
+                                          snapshot_id=selected_id)
+            else:
+                output = Notebook.restore_copy(Path(original), Path(destination))
             self.open_path(output)
         except Exception as exc:
             QMessageBox.warning(self, 'Restore failed', str(exc))
+
+    def export_portable_backup(self):
+        """Create a self-contained .pinbubackup ZIP with assets/ and data/."""
+        if not self.notebook:
+            return
+        from .safe_backup import export_portable
+        try:
+            self._save_panes_in_one_commit(
+                self.tabs.widget(i) for i in range(self.tabs.count()))
+            marker = self.notebook.safesave_backup(
+                Path(str(self.settings.value('backupDirectory', default_backup_folder()))),
+                limit=int(self.settings.value('backupCount', 100)),
+                force=True, reason='portable export')
+            suggested = str(self.notebook.display_path.with_suffix('.pinbubackup'))
+            target, _ = QFileDialog.getSaveFileName(
+                self, 'Export Portable Pinbu Backup', suggested,
+                'Pinbu Backup Archive (*.pinbubackup)')
+            if target:
+                output = export_portable(marker.parent.parent.parent, Path(target))
+                self.statusBar().showMessage(f'Portable backup exported: {output.name}', 5000)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Backup export failed', str(exc))
+
+    def recover_local_working_copy(self):
+        """Recover a retained unsynced session after crash or publish conflict."""
+        from .safe_session import recoverable_sessions
+        records = recoverable_sessions()
+        if not records:
+            QMessageBox.information(self, 'Local recovery', 'No local working copies were found.')
+            return
+        choices = [f"{Path(x['original']).name}  |  {x['opened_at']}  |  "
+                   + ('Unpublished' if x['unpublished'] else 'Saved')
+                   for x in records]
+        choice, ok = QInputDialog.getItem(
+            self, 'Recover Local Working Copy', 'Choose a retained session:',
+            choices, 0, False)
+        if not ok:
+            return
+        source = Path(records[choices.index(choice)]['working'])
+        target, _ = QFileDialog.getSaveFileName(
+            self, 'Restore as NEW notebook',
+            str(Path.home() / 'Documents' / (source.stem + ' Recovered.pinbunote')),
+            'Pinbu Note Notebook (*.pinbunote)')
+        if not target:
+            return
+        try:
+            output = Notebook.restore_copy(source, Path(target))
+            self.open_path(output)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Local recovery failed', str(exc))
 
     def _populate_theme_menu(self):
         """Group names by visual inspiration, preserving saved theme IDs."""
@@ -10147,6 +11454,41 @@ class MainWindow(QMainWindow):
         self.settings.setValue('theme', theme)
         self.apply_theme()
 
+    def show_voice_studio(self):
+        """A modeless privacy-first recorder; does not access the microphone."""
+        studio = self._voice_studio
+        if studio is not None:
+            try:
+                studio.show()
+                studio.raise_()
+                studio.activateWindow()
+                return
+            except RuntimeError:  # native widget was deleted
+                self._voice_studio = None
+        from .voice_dialog import VoiceStudio
+        studio = VoiceStudio(self.settings, self._insert_voice_transcript, self)
+        self._voice_studio = studio
+        studio.destroyed.connect(lambda *_: setattr(self, '_voice_studio', None))
+        studio.show()
+
+    def _insert_voice_transcript(self, text):
+        """Insert into the visible note using native undo history and formatting."""
+        pane = self.active()
+        if pane is None:
+            QMessageBox.information(self, 'No notes open',
+                'Open a notebook and select a notes page to insert transcription.')
+            return
+        editor = pane.notes.editor
+        cursor = editor.textCursor()
+        cursor.beginEditBlock()
+        try:
+            cursor.insertText(str(text))
+        finally:
+            cursor.endEditBlock()
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+        pane.schedule_save()
+
     def show_preferences(self):
         """A scrollable preferences window; its Save/Cancel buttons stay visible."""
         dialog = QDialog(self)
@@ -10210,6 +11552,56 @@ class MainWindow(QMainWindow):
         reduced = QCheckBox('Reduce animations (no moving logo gradient, confetti or scroll drift)')
         reduced.setChecked(str(self.settings.value('reducedMotion', 'false')).lower() == 'true')
         layout.addWidget(reduced)
+        layout.addWidget(QLabel('Page navigator · numbers and research details'))
+        reference_labels = QCheckBox(
+            'Automatically label pages and groups from assigned references')
+        reference_labels.setChecked(str(self.settings.value(
+            'navigatorReferenceLabels', 'false')).lower() == 'true')
+        reference_labels.setToolTip(
+            'Display author/year and page locator in the navigator and preview. '
+            'Original page and group names remain unchanged in the notebook.')
+        layout.addWidget(reference_labels)
+        reference_hint = QLabel(
+            'Display-only: switches back to your own page and group names '
+            'when disabled. Pages without references are left alone.')
+        reference_hint.setWordWrap(True)
+        layout.addWidget(reference_hint)
+        number_default = QComboBox()
+        for label, value in (
+            ('Smart · printed if available, otherwise group order', 'smart'),
+            ('Printed / bibliographic page', 'printed'),
+            ('Original PDF / slide page', 'source'),
+            ('Order within group (1, 2, 3…)', 'tree'),
+            ('Hide page numbers', 'off')):
+            number_default.addItem(label, value)
+        number_default.setCurrentIndex(max(0, number_default.findData(
+            self.settings.value('navigatorNumberDefault', 'smart'))))
+        layout.addWidget(QLabel('Default page number shown'))
+        layout.addWidget(number_default)
+        secondary_info = QComboBox()
+        for label, value in (('Author and year', 'author'),
+                             ('Research tags', 'tags'),
+                             ('Short bibliographic title', 'title'),
+                             ('Nothing', 'none')):
+            secondary_info.addItem(label, value)
+        secondary_info.setCurrentIndex(max(0, secondary_info.findData(
+            self.settings.value('navigatorSecondary', 'author'))))
+        layout.addWidget(QLabel('Secondary navigator detail'))
+        layout.addWidget(secondary_info)
+        hover_info = QComboBox()
+        for label, value in (('Full title + reference summary', 'summary'),
+                             ('Full formatted bibliography on hover', 'full'),
+                             ('Full title only', 'simple')):
+            hover_info.addItem(label, value)
+        hover_info.setCurrentIndex(max(0, hover_info.findData(
+            self.settings.value('navigatorHover', 'summary'))))
+        layout.addWidget(QLabel('Page hover information'))
+        layout.addWidget(hover_info)
+        nav_hint = QLabel('Click a page-number badge to cycle its display. '
+                          'Alt+N works on the selected Groups row. '
+                          'Page-level display choices do not change citations or the notebook file.')
+        nav_hint.setWordWrap(True)
+        layout.addWidget(nav_hint)
         layout.addWidget(QLabel('Reading rewards · gentle encouragement'))
         reading_celebrations = QCheckBox('Show Kawaii celebrations for completed groups, tabs and notebooks')
         reading_celebrations.setChecked(str(self.settings.value('readingCelebrations', 'true')).lower() == 'true')
@@ -10288,9 +11680,33 @@ class MainWindow(QMainWindow):
             durations.addLayout(block)
             session_spins.append((key, spin))
         layout.addLayout(durations)
-        layout.addWidget(QLabel('Project recovery · rotating 10-minute backups'))
+        layout.addWidget(QLabel('Voice Studio · lecture recordings (stored outside notebooks)'))
+        recordings_dir = QLineEdit(str(self.settings.value(
+            'voice/recordingsFolder', '') or default_recordings_folder()))
+        recordings_dir.setToolTip('Default: OS Documents / PinbuNotes / Recordings. '
+            'Only created after you explicitly start a lecture recording.')
+        voice_folder_row = QHBoxLayout()
+        voice_folder_row.addWidget(recordings_dir, 1)
+        choose_recordings = QPushButton('Browse…')
+        def choose_recordings_folder():
+            path = QFileDialog.getExistingDirectory(
+                dialog, 'Choose lecture recording folder', recordings_dir.text())
+            if path:
+                recordings_dir.setText(path)
+        choose_recordings.clicked.connect(choose_recordings_folder)
+        voice_folder_row.addWidget(choose_recordings)
+        layout.addLayout(voice_folder_row)
+        reset_recordings = QPushButton('Restore system Documents default')
+        reset_recordings.clicked.connect(
+            lambda: recordings_dir.setText(str(default_recordings_folder())))
+        layout.addWidget(reset_recordings)
+        hint = QLabel('Lecture WAV and transcript files are kept locally, outside '
+                      'the .pinbunote file. Microphone use always requires Record and permission.')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addWidget(QLabel('SafeSave · deduplicated project histories every 5 minutes'))
         backup_dir = QLineEdit(str(self.settings.value('backupDirectory', default_backup_folder())))
-        backup_dir.setToolTip('User-writable folder for dated portable project backups (no caches).')
+        backup_dir.setToolTip('Each notebook gets its own folder with separate assets/ and data/ histories. Keep this folder on a local disk.')
         folder_row = QHBoxLayout()
         folder_row.addWidget(backup_dir, 1)
         choose_backup = QPushButton('Browse…')
@@ -10302,14 +11718,73 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(choose_backup)
         layout.addLayout(folder_row)
         backup_count = QSpinBox()
-        backup_count.setRange(1, 100)
-        backup_count.setValue(int(self.settings.value('backupCount', 30)))
-        backup_count.setToolTip('Keep at most this many dated recovery snapshots per project.')
-        layout.addWidget(QLabel('Number of backups kept per project'))
+        backup_count.setRange(20, 1000)
+        backup_count.setValue(int(self.settings.value('backupCount', 100)))
+        backup_count.setToolTip('Retain this many deduplicated snapshots for each project, including close snapshots.')
+        layout.addWidget(QLabel('Maximum historical snapshots per project (default 100)'))
         layout.addWidget(backup_count)
+        secondary_enabled = QCheckBox('Keep a second independent backup copy (optional)')
+        secondary_enabled.setChecked(
+            str(self.settings.value('secondaryBackupEnabled', 'false')).lower() == 'true')
+        secondary_enabled.setToolTip('Recommended: a different physical drive. '
+                                    'Pinbu will report a failure separately if this location is unavailable.')
+        layout.addWidget(secondary_enabled)
+        secondary_dir = QLineEdit(str(self.settings.value('secondaryBackupDirectory', '') or ''))
+        secondary_dir.setPlaceholderText('Choose a second folder, ideally on another drive')
+        secondary_dir.setEnabled(secondary_enabled.isChecked())
+        second_row = QHBoxLayout()
+        second_row.addWidget(secondary_dir, 1)
+        choose_secondary = QPushButton('Browse…')
+        choose_secondary.setEnabled(secondary_enabled.isChecked())
+        def choose_secondary_folder():
+            path = QFileDialog.getExistingDirectory(dialog, 'Choose second backup folder',
+                                                     secondary_dir.text() or str(Path.home()))
+            if path:
+                secondary_dir.setText(path)
+        choose_secondary.clicked.connect(choose_secondary_folder)
+        secondary_enabled.toggled.connect(secondary_dir.setEnabled)
+        secondary_enabled.toggled.connect(choose_secondary.setEnabled)
+        second_row.addWidget(choose_secondary)
+        layout.addLayout(second_row)
+        secondary_hint = QLabel('The primary local backup stays enabled. For protection '
+                                'against a failed drive, select a second physical drive. '
+                                'An unavailable second folder is reported, never silently ignored.')
+        secondary_hint.setWordWrap(True)
+        layout.addWidget(secondary_hint)
+        health_button = QPushButton('SafeSave Health & Verify Backups…')
+        health_button.clicked.connect(self.show_backup_health)
+        layout.addWidget(health_button)
+        migrate_backups = QPushButton('Migrate Legacy Backups…')
+        migrate_backups.setToolTip(
+            'Preview and safely convert old full-notebook backups and long-named '
+            'backup folders into readable deduplicated histories. Old copies are retained.')
+        migrate_backups.clicked.connect(self.show_backup_migration)
+        layout.addWidget(migrate_backups)
         layout.addWidget(QLabel('PDF pages are loaded on demand; caches remain disposable.'))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
+        def accept_if_backup_paths_valid():
+            if secondary_enabled.isChecked():
+                from .backup_health import distinct_backup_paths
+                destination = secondary_dir.text().strip()
+                if not destination:
+                    QMessageBox.warning(dialog, 'Choose a second folder',
+                                        'Select the second backup folder or uncheck the option.')
+                    return
+                primary_location = backup_dir.text().strip() or str(default_backup_folder())
+                if not distinct_backup_paths(primary_location, destination):
+                    QMessageBox.warning(dialog, 'Separate backup folders required',
+                                        'The second folder cannot be the primary folder, '
+                                        'or inside it (or vice versa).')
+                    return
+                second_root = Path(destination).expanduser()
+                if not second_root.is_dir() or second_root.is_symlink():
+                    QMessageBox.warning(dialog, 'Second backup folder unavailable',
+                                        'Please choose an existing folder on your '
+                                        'second drive. Pinbu must not silently '
+                                        'create a replacement folder if that drive is missing.')
+                    return
+            dialog.accept()
+        buttons.accepted.connect(accept_if_backup_paths_valid)
         buttons.rejected.connect(dialog.reject)
         outer.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -10321,6 +11796,11 @@ class MainWindow(QMainWindow):
             self.settings.setValue('defaultAlignment', align.currentText())
             self.settings.setValue('showWebLink', web_link.isChecked())
             self.settings.setValue('showJumpEditPosition', jump_edit.isChecked())
+            self.settings.setValue('navigatorReferenceLabels',
+                                   reference_labels.isChecked())
+            self.settings.setValue('navigatorNumberDefault', number_default.currentData())
+            self.settings.setValue('navigatorSecondary', secondary_info.currentData())
+            self.settings.setValue('navigatorHover', hover_info.currentData())
             self.settings.setValue('reducedMotion', reduced.isChecked())
             self.settings.setValue('readingCelebrations', reading_celebrations.isChecked())
             self.settings.setValue('readingConfetti', reading_confetti.isChecked())
@@ -10332,8 +11812,23 @@ class MainWindow(QMainWindow):
             self.settings.setValue('readingViewPersist', persist_view.isChecked())
             self.settings.setValue('readingViewStartAtTop', start_top.isChecked())
             self._extra_scroll_action.setChecked(extra_scroll.isChecked())
-            self.settings.setValue('backupDirectory', backup_dir.text().strip() or str(default_backup_folder()))
+            chosen_recordings = recordings_dir.text().strip()
+            if not chosen_recordings:
+                chosen_recordings = str(default_recordings_folder())
+            self.settings.setValue('voice/recordingsFolder', chosen_recordings)
+            if self._voice_studio is not None:
+                self._voice_studio._mode_changed()
+            chosen_backup = backup_dir.text().strip() or str(default_backup_folder())
+            if any(part in chosen_backup.lower() for part in
+                   ('dropbox', 'onedrive', 'icloud drive', 'mobile documents', 'google drive')):
+                QMessageBox.warning(self, 'Local backup directory required',
+                                    'SafeSave backups must be stored on a local disk, outside cloud-sync folders. '
+                                    'The default system backup location will be used instead.')
+                chosen_backup = str(default_backup_folder())
+            self.settings.setValue('backupDirectory', chosen_backup)
             self.settings.setValue('backupCount', backup_count.value())
+            self.settings.setValue('secondaryBackupEnabled', secondary_enabled.isChecked())
+            self.settings.setValue('secondaryBackupDirectory', secondary_dir.text().strip())
             self.settings.setValue('focusSounds', focus_sounds.isChecked())
             self.settings.setValue('focusRepeat', focus_repeat.isChecked())
             self.settings.setValue('focusVolume', focus_volume.value())
@@ -10349,6 +11844,7 @@ class MainWindow(QMainWindow):
             self._notebook_progress_bar.set_reduced_motion(reduced.isChecked())
             for i in range(self.tabs.count()):
                 pane = self.tabs.widget(i)
+                pane._refresh_number_labels()
                 pane.reading_progress.set_reduced_motion(reduced.isChecked())
                 pane.group_tree.set_reading_reduced_motion(reduced.isChecked())
                 pane.pages_list._hover_delegate.anim.setDuration(0 if reduced.isChecked() else 180)
@@ -10357,6 +11853,163 @@ class MainWindow(QMainWindow):
                 pane.notes.set_web_link_visible(web_link.isChecked())
                 pane.notes.set_jump_edit_visible(jump_edit.isChecked())
                 pane.update_preview_clarity()
+
+    def show_backup_migration(self, destination_folder=None):
+        """User-triggered, preview-first migration of old backup formats.
+
+        Large PDF imports run on a worker thread. Never delete older full-file
+        backups; long-ID project folders are preserved in a legacy archive.
+        """
+        from .backup_migration import scan_legacy_backups, migrate_legacy_backups
+
+        class BusyDialog(QDialog):
+            active = False
+            def reject(self):
+                if not self.active:
+                    super().reject()
+            def closeEvent(self, event):
+                if self.active:
+                    event.ignore()
+                else:
+                    super().closeEvent(event)
+
+        target = Path(destination_folder or str(self.settings.value(
+            'backupDirectory', default_backup_folder()))).expanduser()
+        dialog = BusyDialog(self)
+        dialog.setWindowTitle('Migrate Legacy Backups · SafeSave')
+        dialog.resize(650, 510)
+        layout = QVBoxLayout(dialog)
+        explanation = QLabel(
+            'Find older complete .pinbunote/.yomunote/.yominote backups, '
+            'early folder projects, and long-named SafeSave histories. '
+            'Imported snapshots share unchanged PDFs and images. '
+            'Old backup material is retained for recovery.')
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        layout.addWidget(QLabel('Folder to scan for older backups'))
+        source_path = QLineEdit(str(target))
+        source_row = QHBoxLayout()
+        source_row.addWidget(source_path, 1)
+        browse = QPushButton('Browse…')
+        def browse_source():
+            picked = QFileDialog.getExistingDirectory(
+                dialog, 'Select an old Pinbu/Yomu backup folder', source_path.text())
+            if picked:
+                source_path.setText(picked)
+        browse.clicked.connect(browse_source)
+        source_row.addWidget(browse)
+        layout.addLayout(source_row)
+        destination_hint = QLabel(f'New project histories are created in: {target}')
+        destination_hint.setWordWrap(True)
+        layout.addWidget(destination_hint)
+        preview = QPlainTextEdit(dialog)
+        preview.setReadOnly(True)
+        preview.setPlaceholderText('Select Scan Folder to preview legacy backups.')
+        layout.addWidget(preview, 1)
+        progress = QProgressBar(dialog)
+        progress.setVisible(False)
+        layout.addWidget(progress)
+        actions = QHBoxLayout()
+        scan = QPushButton('Scan Folder')
+        migrate = QPushButton('Migrate Found Backups…')
+        migrate.setEnabled(False)
+        close = QPushButton('Close')
+        actions.addWidget(scan)
+        actions.addWidget(migrate)
+        actions.addStretch(1)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        close.clicked.connect(dialog.reject)
+        state = {'items': []}
+
+        def do_scan():
+            migrate.setEnabled(False)
+            state['items'] = []
+            try:
+                items, issues = scan_legacy_backups(Path(source_path.text()))
+                state['items'] = items
+                rows = [f'Found {len(items)} potential legacy backups.\n']
+                for item in items[:200]:
+                    rows.append(f'[{item.kind}] {item.title} — {item.path.name}' +
+                                (f'  ⚠ {item.warning}' if item.warning else ''))
+                if len(items) > 200:
+                    rows.append(f'...plus {len(items)-200} more files.')
+                if issues:
+                    rows.append(f'\nSkipped {len(issues)} unreadable/unsupported entries:')
+                    rows.extend(issues[:30])
+                if not items and not issues:
+                    rows.append('No legacy backups found here. You can Browse to an older backup folder.')
+                rows.append('\nMigration never deletes an old full-file backup. '
+                            'Old long-named project folders are preserved under '
+                            '"_Legacy Originals (kept)" after a verified copy is made.')
+                preview.setPlainText('\n'.join(rows))
+                migrate.setEnabled(bool(items))
+            except Exception as exc:
+                preview.setPlainText(f'Could not scan backup folder: {exc}')
+        scan.clicked.connect(do_scan)
+
+        def do_migrate():
+            items = list(state['items'])
+            if not items:
+                return
+            reply = QMessageBox.question(
+                dialog, 'Convert old backups?',
+                f'Import {len(items)} old backup entries into new deduplicated '
+                'project histories?\n\n'
+                'Your old full-file backups will NOT be deleted. Previously '
+                'indexed project folders will be retained in '
+                '"_Legacy Originals (kept)" after verification.\n\n'
+                'Migration can require substantial local disk space temporarily.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            dialog.active = True
+            for button in (scan, browse, migrate, close):
+                button.setEnabled(False)
+            source_path.setReadOnly(True)
+            progress.setRange(0, 0)
+            progress.setVisible(True)
+            preview.appendPlainText('\nMigrating and verifying...')
+            def worker():
+                return migrate_legacy_backups(items, target)
+            def finished(report, error):
+                dialog.active = False
+                progress.setVisible(False)
+                for button in (scan, browse, close):
+                    button.setEnabled(True)
+                source_path.setReadOnly(False)
+                if error:
+                    preview.appendPlainText(f'\nMigration failed: {error}')
+                    QMessageBox.warning(dialog, 'Backup migration failed', str(error))
+                    return
+                preview.appendPlainText(
+                    f'\nConverted: {report.converted}  |  Already imported: '
+                    f'{report.already_imported}  |  Failed: {report.failed}')
+                if report.failures:
+                    preview.appendPlainText('\nErrors (old backups retained):\n' +
+                                            '\n'.join(report.failures[:30]))
+                QMessageBox.information(
+                    dialog, 'Backup migration finished',
+                    f'{report.converted} converted, {report.already_imported} already '
+                    f'imported, {report.failed} failed.\n\n'
+                    'Original full-file backups have been kept. Use '
+                    'File → Restore From Backup to restore a snapshot.')
+                do_scan()
+            start_task(self, worker, finished, priority=-1)
+
+        migrate.clicked.connect(do_migrate)
+        do_scan()
+        dialog.exec()
+
+    def show_keyboard_shortcuts(self):
+        """Show a searchable guide built from real menu actions and notes keys.
+
+        This is intentionally read-only. Opening Help cannot edit a notebook,
+        register extra shortcuts or instantiate another notes editor.
+        """
+        from .shortcut_reference import KeyboardShortcutsDialog
+        KeyboardShortcutsDialog(self).exec()
 
     def show_about(self):
         """Open a lightweight popup that dismisses on outside click or Escape."""
@@ -10395,6 +12048,12 @@ class MainWindow(QMainWindow):
         popup.show()
 
     def closeEvent(self, event):
+        if self._voice_studio is not None and self._voice_studio.isVisible():
+            self._voice_studio.close()
+            if self._voice_studio.isVisible():
+                # A user declined to stop recording/transcribing.
+                event.ignore()
+                return
         if self._exchange_busy:
             QMessageBox.information(self, 'Tab exchange active',
                                     'Finish or cancel the tab exchange before quitting.')
@@ -10408,21 +12067,59 @@ class MainWindow(QMainWindow):
             if self.notebook:
                 self._save_panes_in_one_commit(
                     self.tabs.widget(i) for i in range(self.tabs.count()))
+                self._backup_before_close(self.notebook)
+            if self.notebook and getattr(self.notebook, '_unpublished', False):
+                dialog = QMessageBox(self)
+                dialog.setIcon(QMessageBox.Icon.Question)
+                dialog.setWindowTitle('Unsaved changes')
+                dialog.setText('You have some changes you’ve made that haven’t yet been saved. '
+                               'Are you sure you wish to exit?')
+                dialog.setInformativeText(
+                    'Your work is saved locally and backed up. '
+                    'Save & Close publishes it to your chosen notebook location. '
+                    'Close Without Saving does not publish, but keeps your '
+                    'local recovery copies in case you need them later.')
+                save_close = dialog.addButton('Save & Close', QMessageBox.ButtonRole.AcceptRole)
+                discard = dialog.addButton('Close Without Saving', QMessageBox.ButtonRole.DestructiveRole)
+                go_back = dialog.addButton('Go back', QMessageBox.ButtonRole.RejectRole)
+                dialog.setDefaultButton(go_back)
+                dialog.exec()
+                choice = dialog.clickedButton()
+                if choice is go_back or choice not in (save_close, discard):
+                    event.ignore()
+                    return
+                if choice is save_close:
+                    # An exception keeps the window open and leaves the local
+                    # working copy/backup intact; never report success early.
+                    self.notebook.publish()
+                    self.settings.setValue(self._publish_health_key(),
+                                           datetime.now(timezone.utc).isoformat())
+            if self.notebook:
+                from .safe_session import mark_normal_close
+                mark_normal_close(self.notebook)
             self.save_open_tabs()
             event.accept()
+        except NotebookNewerVersionError as exc:
+            QMessageBox.warning(
+                self, 'Notebook from newer Pinbu Note — upgrade recommended',
+                f'{exc}\n\nThe original was NOT overwritten. '
+                'Use Close Without Saving to retain the local recovery copy.')
+            event.ignore()
         except NotebookExternallyModifiedError as exc:
-            answer = QMessageBox.question(
-                self, 'External changes detected — save blocked',
-                f'{exc}\n\nThe notebook on disk has NOT been overwritten.\n\n'
-                'Exit WITHOUT saving this session’s latest edits?\n'
-                'Choose No to stay open and inspect your recovery options.',
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer == QMessageBox.StandardButton.Yes:
-                self.save_open_tabs()
-                event.accept()
-            else:
-                event.ignore()
+            QMessageBox.warning(
+                self, 'Publishing blocked — local work preserved',
+                f'{exc}\n\nThe original notebook has NOT been overwritten. '
+                'Pinbu will stay open. Choose Close Without Saving to close '
+                'while keeping the local recovery files.')
+            event.ignore()
         except Exception as exc:
-            QMessageBox.critical(self, 'Could not save before exit', str(exc))
+            # Keep the app open on save failure and explain how to recover.
+            # Qt event callbacks must not allow accidental application exit.
+            import logging
+            logging.exception('Pinbu Note could not complete its shutdown save')
+            QMessageBox.critical(
+                self, 'Could not save before exit',
+                f'{exc}\n\nPinbu Note remains open. Your local working copy '
+                'has not been intentionally discarded. Retry saving or use '
+                'Save Copy As before closing.')
             event.ignore()

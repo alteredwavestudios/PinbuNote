@@ -24,7 +24,8 @@ def test_mainwindow_self_method_calls_are_defined():
     methods = {n.name for n in klass.body if isinstance(n, ast.FunctionDef)}
     qt_inherited = {'menuBar','resize','setCentralWidget','setMinimumSize',
                     'setStatusBar','setWindowTitle','statusBar','windowState',
-                    'setAcceptDrops'}
+                    'setAcceptDrops', 'isFullScreen', 'isMaximized',
+                    'showFullScreen', 'showMaximized', 'showNormal'}
     refs = {n.func.attr for fn in klass.body if isinstance(fn, ast.FunctionDef)
             for n in ast.walk(fn) if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)

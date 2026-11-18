@@ -1,3 +1,50 @@
+## v1.0 — Core Study Notebook (source release candidate)
+- Removed the nonworking experimental v0.97 annotation-to-notes subsystem, including toolbar and context-menu actions, bookmarks, persistence writes and special undo callbacks.
+- Kept preview-only dark reading / inversion, improved tinted-black text contrast, and retained all v0.96 finishing touches and v0.95 storage hardening.
+- Kept v7 notebook / v5 project format; legacy v0.97 link metadata is ignored, then omitted when a notebook is saved by v1.0.
+- Ran security, backup and format tests, per-file hang-detection audit, and synthetic storage/raster performance checks (see V100_FINAL_AUDIT.md).
+
+
+## v0.97 — withdrawn experiment (historical notes)
+- Non-destructive preview dark reading and inversion.
+- Annotation-to-notes bookmarks with source-return navigation, context menus and undo/persistence support.
+
+## v0.95 — Stability release (based on v0.9.2b)
+
+- Bounded SQLite notebook manifest reads across entry points.
+- Safe, user-visible save-error handling on exit.
+- Release metadata and packaging updated to v0.95, preserving file format v7.
+- No PinbuBoard changes.
+
+## v0.9.2b — Research navigator numbers and context (experimental)
+
+- Click page-number badges in either navigator view to cycle citation/printed,
+  source-document and in-tree order labels; click never changes citation data.
+- Filled/outlined markers distinguish direct and inherited bibliography links.
+- Hover contextual page information; optional complete rich-italic bibliography.
+- Preferences for default number, secondary detail and hover information.
+- Sparse per-page display-only settings in OS QSettings, not notebook SQLite.
+- Notebook format stays v7, tab project stays v5, SafeSave backup stays v1.
+- See `START-HERE-v0.9.2b.md` and `RELEASE_NOTES_v0.9.2b.md`.
+
+## v0.9.2a — Research structure and navigator citations (experimental)
+
+- Sparse group/page references, inherited citations, page-number offsets,
+  Roman numbering, tags, inherited tag exclusions and stable undoable state.
+- First Cite Them Right Harvard book/chapter/journal/website/film/media
+  formatting with safe rich-text clipboard HTML and plain-text fallback.
+- Data persists inside notebook SQL container, project v5 / notebook v7.
+- Preserve effective page metadata on ungroup, move and cross-tab transfer.
+- See `RELEASE_NOTES_v0.9.2a.md`; this is **not** a stable published release.
+
+## v0.9.1 — SafeSave Health, quiet autosave footer and optional second backups
+
+- Permanent, small Autosave timestamp in the bottom status bar (no celebration).
+- Independently managed and reported optional secondary deduplicated backup location.
+- Backup Health window: timestamps, snapshot count, storage usage and verified restore tests.
+- Missing-asset errors identify the active notebook when switching to another notebook.
+- Version/installer/build workflow aligned for v0.9.1 without changing notebook v6 or backup v1.
+
 ## v0.8.6b — Sticky Notes, Bookmarks & Notebook Safety (development)
 
 - Add skeuomorphic editable sticky-note annotations with colour, fonts and

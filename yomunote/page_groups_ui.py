@@ -10,11 +10,11 @@ children.  Qt handles the indentation and disclosure arrows for us.
 from __future__ import annotations
 import json
 from PySide6.QtCore import Qt, Signal, QMimeData, QSize, QRect, QPoint, QPointF, QRectF, QVariantAnimation, QEasingCurve, QAbstractAnimation, QEvent, QPersistentModelIndex
-from PySide6.QtGui import QDrag, QKeySequence, QFont, QPainter, QColor, QIcon, QPalette, QPen
+from PySide6.QtGui import QDrag, QKeySequence, QFont, QPainter, QColor, QIcon, QPalette, QPen, QFontMetrics
 from .bookmark_badge import paint_bookmark_ribbon
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QTreeWidget,
                               QTreeWidgetItem, QStyledItemDelegate,
-                              QStyle, QStyleOptionViewItem)
+                              QStyle, QStyleOptionViewItem, QToolTip)
 
 
 ROLE_KIND = Qt.ItemDataRole.UserRole
@@ -62,6 +62,60 @@ class GroupRowDelegate(QStyledItemDelegate):
         # Never hide GROUP titles: their labels are loaded directly from
         # metadata, long before (and entirely independently of) thumbnails.
         # Let Qt elide them naturally at narrow widths.
+
+    @staticmethod
+    def number_rect(rect, density):
+        """The visible badge and clickable/hoverable region are identical."""
+        width = 55 if density in ('normal', 'wide') else 45 if density == 'compact' else 36
+        return QRect(rect.right() - width - 5, rect.bottom() - 23, width, 19)
+
+    def _paint_page_number(self, painter, option, index):
+        view = self.parent()
+        info = getattr(view, '_display_rows', {}).get(index.data(ROLE_ID))
+        if not info or not info['number']:
+            return
+        rect = self.number_rect(option.rect, getattr(view, '_nav_density', 'normal'))
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        base = view.palette().color(QPalette.ColorRole.Base)
+        ink = view.palette().color(QPalette.ColorRole.Text)
+        button = QColor(base)
+        button.setAlpha(230)
+        painter.setBrush(button)
+        painter.setPen(QPen(self.accent if info['direct'] else
+                            view.palette().color(QPalette.ColorRole.Mid), 0.7))
+        painter.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+        painter.setPen(ink)
+        font = QFont('Montserrat', 8)
+        font.setBold(False)
+        painter.setFont(font)
+        # Filled diamond = explicit reference, outline = inherited reference.
+        glyph = '◆' if info['direct'] else '◇' if info['reference_id'] else ''
+        text = glyph + (' ' if glyph else '') + info['number']
+        metrics = painter.fontMetrics()
+        text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, rect.width() - 6)
+        painter.drawText(rect.adjusted(3, 0, -3, 0),
+                         Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
+        # Optional compact author / tag / source detail, immediately below
+        # the page label. Never paint it over the number badge or checkbox.
+        density = getattr(view, '_nav_density', 'normal')
+        extra = info.get('secondary') or ''
+        if extra and density in ('normal', 'wide', 'compact'):
+            left = option.rect.left() + (54 if density == 'compact' else
+                                         67 if density == 'normal' else 83)
+            available = rect.left() - left - 4
+            if available >= 28:
+                painter.save()
+                # Mid is a shadow/border role and was illegible on dark rows.
+                painter.setPen(view.palette().color(QPalette.ColorRole.Text))
+                painter.setFont(QFont('Montserrat', 8))
+                display = painter.fontMetrics().elidedText(
+                    extra, Qt.TextElideMode.ElideRight, available)
+                painter.drawText(QRect(left, rect.top(), available, rect.height()),
+                                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                                 display)
+                painter.restore()
 
     def _checkbox_rect(self, option, index):
         """Use the *same* style geometry for painting and mouse handling."""
@@ -279,6 +333,8 @@ class GroupRowDelegate(QStyledItemDelegate):
                             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
                             painter.drawPixmap(QPoint(x, y), pic)
                             painter.restore()
+        if index.data(ROLE_KIND) == 'page':
+            self._paint_page_number(painter, option, index)
         # Overlay just the checkbox in the same native hit rectangle.
         self._paint_read_indicator(
             painter, option, index)
@@ -316,6 +372,7 @@ class PageGroupsTree(QTreeWidget):
     pagesPasted = Signal(str, str, list, bool)
     readToggled = Signal(str, str, bool)
     groupMoveRequested = Signal(str, object, object)
+    numberClicked = Signal(str)  # Display-only, no notebook metadata writes.
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -333,6 +390,9 @@ class PageGroupsTree(QTreeWidget):
         self._active_painted = []
         self._thumb_ids = set()
         self._check_states = {}
+        self._display_rows = {}
+        self._original_titles = {}  # stable (kind, id) -> real saved title
+        self._number_press_id = None  # badge clicks must not activate a page
         # A single 420ms animation drives the visible progress bars for ALL
         # groups/subgroups. It tracks stable group IDs, never tree item objects.
         # No per-folder animation timer and no extra thumbnails or PDF loads.
@@ -363,6 +423,88 @@ class PageGroupsTree(QTreeWidget):
         self.itemChanged.connect(self._read_check_changed)
         self.itemExpanded.connect(lambda item: self._collapse(item, False))
         self.itemCollapsed.connect(lambda item: self._collapse(item, True))
+
+    def set_research_display(self, rows, *, group_labels=None):
+        """Update displayed labels in-place without touching saved group names.
+
+        IMPORTANT: extract_tree() is used to save the group tree after drag
+        and drop. It must take names from _original_titles rather than from
+        synthetic author/year labels shown on screen.
+        """
+        self._display_rows = rows
+        group_labels = group_labels or {}
+        self._rebuilding = True  # suppress checkbox events while changing text
+        try:
+            for (kind, identifier), source_title in self._original_titles.items():
+                item = self.find_item(kind, identifier)
+                if item is None:
+                    continue
+                if kind == 'group':
+                    shown = group_labels.get(identifier, source_title)
+                    item.setText(0, shown)
+                    completed, total = item.data(0, ROLE_PROGRESS) or (0, 0)
+                    tip = source_title + f' · {completed}/{total} read'
+                    if shown != source_title:
+                        tip += ' · Display label: ' + shown
+                    item.setToolTip(0, tip + ' · Drag to organise; tick to mark all read')
+                else:
+                    info = rows.get(identifier)
+                    if info is not None:
+                        item.setText(0, info.get('display_title', source_title))
+                        item.setToolTip(0, info['tooltip'])
+                        item.setData(0, Qt.ItemDataRole.AccessibleDescriptionRole,
+                            info['number_tooltip'] + '. ' + info['reference_summary'])
+        finally:
+            self._rebuilding = False
+        self.viewport().update()
+
+    def _number_hit(self, point):
+        index = self.indexAt(point)
+        if not index.isValid() or index.data(ROLE_KIND) != 'page':
+            return None
+        page_id = index.data(ROLE_ID)
+        info = self._display_rows.get(page_id)
+        if not info or not info['number']:
+            return None
+        rect = self.itemDelegate().number_rect(
+            self.visualRect(index), self._nav_density)
+        return page_id if rect.contains(point) else None
+
+    def mousePressEvent(self, event):
+        # Prevent Qt changing selection on badge mouse-down. The release
+        # handler emits the cycle signal only when released over that badge.
+        self._number_press_id = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._number_press_id = self._number_hit(event.position().toPoint())
+            if self._number_press_id is not None:
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        pending = self._number_press_id
+        self._number_press_id = None
+        if event.button() == Qt.MouseButton.LeftButton and pending is not None:
+            if pending == self._number_hit(event.position().toPoint()):
+                self.numberClicked.emit(pending)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self._number_hit(event.position().toPoint()) is not None:
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Type.ToolTip:
+            pid = self._number_hit(event.pos())
+            if pid is not None:
+                info = self._display_rows[pid]
+                QToolTip.showText(event.globalPos(), info['number_tooltip'], self.viewport())
+                return True
+        return super().viewportEvent(event)
 
     def set_navigator_density(self, width):
         """Switch presentation, not the underlying tree or cached images.
@@ -464,6 +606,7 @@ class PageGroupsTree(QTreeWidget):
             self._thumb_ids.clear()
             self._check_states.clear()
             self._item_indexes.clear()
+            self._original_titles.clear()
             self._last_tree = groups
 
             def fill(parent, nodes):
@@ -488,6 +631,7 @@ class PageGroupsTree(QTreeWidget):
                             else Qt.CheckState.PartiallyChecked if completed
                             else Qt.CheckState.Unchecked))
                         item.setData(0, ROLE_ID, node['id'])
+                        self._original_titles[('group', node['id'])] = node['name']
                         item.setToolTip(
                             0, node['name'] + f' · {completed}/{total} read'
                             ' · Drag to organise; tick to mark all read')
@@ -514,6 +658,7 @@ class PageGroupsTree(QTreeWidget):
                             else Qt.CheckState.Unchecked)
                         self._check_states[('page', pid)] = item.checkState(0)
                         item.setData(0, ROLE_ID, pid)
+                        self._original_titles[('page', pid)] = title
                         bookmark = by_id.get(pid, {}).get('bookmark')
                         item.setData(0, ROLE_BOOKMARK, bool(bookmark))
                         item.setToolTip(0, title +
@@ -673,7 +818,7 @@ class PageGroupsTree(QTreeWidget):
         if item is None:
             return
         item.setData(0, ROLE_BOOKMARK, bool(label))
-        title = item.text(0)
+        title = self._original_titles.get(('page', page_id), item.text(0))
         item.setToolTip(0, title + (f' · 🔖 {label}' if label else '') +
                         ' · Tick to mark read')
 
@@ -711,7 +856,7 @@ class PageGroupsTree(QTreeWidget):
                 return {'type': 'page', 'page_id': item.data(0, ROLE_ID)}
             group_id = item.data(0, ROLE_ID)
             result = {'type': 'group', 'id': group_id,
-                      'name': item.text(0),
+                      'name': self._original_titles.get(('group', group_id), item.text(0)),
                       'collapsed': not item.isExpanded(),
                       'children': [walk(item.child(j)) for j in range(item.childCount())]}
             if previous.get(group_id, {}).get('extra_vertical_scroll') is True:
@@ -833,6 +978,13 @@ class PageGroupsTree(QTreeWidget):
         return None
 
     def keyPressEvent(self, event):
+        if (event.key() == Qt.Key.Key_N and
+                event.modifiers() == Qt.KeyboardModifier.AltModifier):
+            item = self.currentItem()
+            if item is not None and item.data(0, ROLE_KIND) == 'page':
+                self.numberClicked.emit(item.data(0, ROLE_ID))
+                event.accept()
+                return
         if event.matches(QKeySequence.StandardKey.Copy):
             selected = self.selected_page_ids()
             if selected and getattr(self, 'notebook_id', None):

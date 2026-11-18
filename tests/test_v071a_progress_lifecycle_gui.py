@@ -26,7 +26,7 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
-def test_status_widgets_survive_read_checkbox_undo_and_tab_creation(app, monkeypatch, tmp_path):
+def test_status_widgets_survive_read_checkbox_undo_and_tab_creation(app, monkeypatch, tmp_path, close_test_window):
     # Isolate settings and the notebook from the user's existing files.
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'settings'))
@@ -81,7 +81,7 @@ def test_status_widgets_survive_read_checkbox_undo_and_tab_creation(app, monkeyp
         app.processEvents()
         assert isValid(label) and isValid(bar)
     finally:
-        window.close()
+        close_test_window(window)
         app.processEvents()
 
 

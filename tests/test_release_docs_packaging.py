@@ -22,15 +22,17 @@ def test_release_process_is_draft_only():
     assert '--draft --prerelease' in workflow
     assert 'needs: [windows, macos]' in workflow
     assert 'actions/upload-artifact@v4' in workflow
-    assert 'PinbuNote_Setup_v0.8.7c.exe' in workflow
-    assert 'PinbuNote-0.8.7c-macOS-arm64-unsigned.dmg' in workflow
-    assert 'PinbuNote-0.8.7c-macOS-x86_64-unsigned.dmg' in workflow
+    assert 'PinbuNote_Setup_v${version}.exe' in workflow
+    assert 'PinbuNote-${version}-macOS-arm64-unsigned.dmg' in workflow
+    assert 'PinbuNote-${version}-macOS-x86_64-unsigned.dmg' not in workflow
     assert '\n  linux:\n' not in workflow
     # Linux remains source-only, with its regression suite in CI.
     ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
     assert 'ubuntu-22.04' in ci
     assert 'YomuNote-Full-Test-Audit.py' in ci
-    assert 'macos-15-intel' in workflow
+    assert 'macos-15-intel' not in workflow
+    assert 'os: macos-15' in workflow
+    assert 'macos-15' in ci
 
 
 def test_all_release_builds_stage_local_ocr():

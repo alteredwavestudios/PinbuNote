@@ -1,20 +1,18 @@
-# v0.8.5 — Release acceptance checklist
+# Pinbu Note v1.0 — Publication gates
 
-**Status:** Source candidate prepared. NOT yet published or installed as a
-0.8.5 Windows/macOS package. The user has confirmed v0.8.4c works locally.
+This source candidate is **not yet cleared for public release**. The accompanying audit report details which checks passed in this environment.
 
-- [x] Release version, Inno Setup filename and numeric version, macOS DMG
-      names and GitHub Actions expected assets aligned to v0.8.5.
-- [x] Windows installer AppId, SQLite DLL safety check, frozen EXE startup
-      smoke test and offline OCR verification preserved.
-- [x] Notebook schema remains v5; underlying 0.8.4c application behaviour
-      retained unchanged.
-- [ ] GitHub pull-request source tests pass on Windows, macOS and Linux.
-- [ ] Fresh Windows installer build passes frozen EXE/SQLite and OCR checks.
-- [ ] Both macOS architectures produce valid DMGs; test where possible.
-- [ ] Installed Windows app test: notebooks, text selection/highlighting,
-      OCR, imported tabs, undo, autosaving and existing settings survive.
-- [ ] Confirm checksums and any unsigned build warnings.
-- [ ] Publish **draft pre-release** manually after acceptance.
+- [x] App/library, installer, workflow, test and release-note version strings agree on **1.0 / v1.0**.
+- [x] All annotation-to-notes runtime code has been removed; old standalone PDF annotations and notes remain supported.
+- [x] Notebook schema v7 and tab format v5 unchanged.
+- [x] Full-source static compilation and integrated headless regression suite pass.
+- [x] Existing SafeSave / malicious metadata tests, old project compatibility tests and synthetic performance tests run.
+- [ ] PySide6 native GUI smoke test: launch, new notebook, F11, minimal themes, navigation, F1 help, import PDF and page preview, dark/invert/original modes, annotations, editor undo/redo, quit/save/reopen.
+- [ ] Windows installer build/upgrade test including PyInstaller startup, bundled OCR and SQLite DLL configuration.
+- [ ] macOS arm64 and Intel: signed/offline OCR dependencies verification, app launch, DMG install, first-run privacy prompts and long session memory.
+- [ ] Large real-world document test: PDF scrolling, OCR, photo annotation, zoom, memory growth, and thumbnail eviction.
+- [ ] Voice Studio microphone and recorder test (existing experimental feature; transcription needs a separately supplied offline model).
+- [ ] SafeSave with Dropbox/OneDrive/iCloud sync conflicts verified on native systems using *copies* of notebooks.
+- [ ] Confirm exact native asset names and checksums; review GitHub **draft** release before publishing.
 
-This package is *source*, not the final unsigned native installer.
+**Never mark the app signed/notarised; current macOS DMGs are unsigned.**

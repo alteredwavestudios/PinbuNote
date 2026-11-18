@@ -55,7 +55,10 @@ def test_responsive_toolbar_order_and_mode(app,tmp_path):
         pane.canvas.resize(450,600)
         pane._update_annotation_toolbar_layout()
         assert pane.annotation_mode_buttons['select'].toolButtonStyle()==Qt.ToolButtonStyle.ToolButtonIconOnly
+        # Photo + Sticky tools were added after the original nine-tool test.
         assert len(pane._annotation_footer_buttons)==11
+        assert pane._annotation_photo_button in pane._annotation_footer_buttons
+        assert pane._annotation_overflow in pane._annotation_footer_buttons
         pane._theme_annotation_toolbar(window.current_palette)
         assert not pane._annotation_footer_buttons[0].icon().isNull()
     finally:
